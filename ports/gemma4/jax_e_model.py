@@ -21,7 +21,6 @@ from typing import Dict, List, Optional, Tuple, Union
 import jax
 import jax.numpy as jnp
 from jax import lax
-from jax.experimental import pallas as pl
 
 
 @dataclasses.dataclass
@@ -93,36 +92,57 @@ def qat_int8_matmul_jax(x: jax.Array, weight_int8: jax.Array, scale: jax.Array) 
     return jnp.matmul(x, w_fp)
 
 
-def qat_w4a16_unpack_dequant_jax(packed_int4: jax.Array, scale: jax.Array, group_size: int = 32) -> jax.Array:
-    """Dequantize packed int4 weights to bfloat16 using JAX lax ops.
-    
-    packed_int4: [K // 2, N] int8 array containing 2 packed 4-bit unsigned/signed values per byte.
-    scale: [K // group_size, N] bfloat16 scales.
+def qat_w4a16_unpack_dequant_jax(
+    packed_int4: jax.Array,
+    scale: jax.Array,
+    group_size: int = 32,
+) -> jax.Array:
+    """Decode compressed-tensors ``pack-quantized`` W4A16 weights.
+
+    The Gemma 4 checkpoints store a linear weight in its native HF orientation:
+    ``packed_int4[out, in/8]`` as int32 and ``scale[out, in/32]`` as BF16.
+    Nibble ``i`` of word ``j`` is input column ``8*j+i`` and stores ``q + 8``.
+    The returned array is BF16 ``[out, in]``.
+
+    This reference implementation intentionally materializes the dequantized
+    layer weight. It is correctness-first; replace it with a fused Pallas
+    dequant-matmul before calling W4A16 performance-optimal.
     """
-    K_half, N = packed_int4.shape
-    K = K_half * 2
-    
-    # Extract lower and upper 4-bit values
-    low = packed_int4 & 0x0F
-    high = (packed_int4 >> 4) & 0x0F
-    
-    # Interleave low and high along K dimension
-    unpacked = jnp.stack([low, high], axis=1).reshape(K, N)
-    
-    # Zero-point offset subtraction (assuming symmetric int4 [-8, 7] represented as unsigned [0, 15])
-    unpacked_signed = unpacked.astype(jnp.float32) - 8.0
-    
-    # Expand scales across group_size
-    num_groups = K // group_size
-    scale_expanded = jnp.repeat(scale, group_size, axis=0) # [K, N]
-    
-    return (unpacked_signed * scale_expanded).astype(jnp.bfloat16)
+    if packed_int4.ndim != 2 or scale.ndim != 2:
+        raise ValueError(
+            f"W4A16 expects rank-2 packed/scale arrays, got "
+            f"{packed_int4.shape} and {scale.shape}"
+        )
+    if packed_int4.dtype != jnp.int32:
+        raise TypeError(
+            f"W4A16 packed weights must be int32, got {packed_int4.dtype}"
+        )
+
+    out_features, packed_k = packed_int4.shape
+    in_features = packed_k * 8
+    expected_scale_shape = (out_features, in_features // group_size)
+    if in_features % group_size or scale.shape != expected_scale_shape:
+        raise ValueError(
+            f"W4A16 scale shape {scale.shape} does not match packed shape "
+            f"{packed_int4.shape}; expected {expected_scale_shape}"
+        )
+
+    shifts = (jnp.arange(8, dtype=jnp.int32) * 4)[None, None, :]
+    words = packed_int4[:, :, None]
+    q = ((words >> shifts) & jnp.int32(0xF)).reshape(
+        out_features, in_features
+    )
+    q = q.astype(jnp.bfloat16) - jnp.bfloat16(8)
+    expanded_scale = jnp.repeat(
+        scale.astype(jnp.bfloat16), group_size, axis=1
+    )
+    return q * expanded_scale
 
 
 def qat_w4a16_linear_jax(x: jax.Array, packed_int4: jax.Array, scale: jax.Array, group_size: int = 32) -> jax.Array:
     """W4A16 QAT Linear layer execution on TPU."""
     w_dequant = qat_w4a16_unpack_dequant_jax(packed_int4, scale, group_size=group_size)
-    return jnp.matmul(x, w_dequant)
+    return jnp.matmul(x, w_dequant.T)
 
 
 # ==============================================================================

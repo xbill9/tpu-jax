@@ -46,17 +46,22 @@ class TestGemma4EJAX(unittest.TestCase):
         self.assertEqual(share_map[4], 1)
 
     def test_w4a16_unpack_dequant(self):
-        K_half, N = 16, 8
+        out_features, in_features = 8, 32
         group_size = 8
-        packed = jnp.zeros((K_half, N), dtype=jnp.int8) + 0x42  # low=2, high=4
-        scale = jnp.ones((K_half * 2 // group_size, N), dtype=jnp.bfloat16)
+        # Nibbles 0..7 encode q=-8..-1 in every int32 word.
+        word = sum(i << (4 * i) for i in range(8))
+        packed = jnp.full(
+            (out_features, in_features // 8), word, dtype=jnp.int32
+        )
+        scale = jnp.ones(
+            (out_features, in_features // group_size), dtype=jnp.bfloat16
+        )
 
         unpacked = qat_w4a16_unpack_dequant_jax(packed, scale, group_size=group_size)
-        self.assertEqual(unpacked.shape, (32, 8))
+        self.assertEqual(unpacked.shape, (out_features, in_features))
         self.assertEqual(unpacked.dtype, jnp.bfloat16)
-        # low (2) - 8 = -6; high (4) - 8 = -4
-        self.assertAlmostEqual(float(unpacked[0, 0]), -6.0)
-        self.assertAlmostEqual(float(unpacked[1, 0]), -4.0)
+        self.assertAlmostEqual(float(unpacked[0, 0]), -8.0)
+        self.assertAlmostEqual(float(unpacked[0, 7]), -1.0)
 
     def test_model_forward_fp16(self):
         model = Gemma4EModelJAX(self.config)
@@ -117,13 +122,32 @@ class TestGemma4EJAX(unittest.TestCase):
             "model.embed_tokens.weight": jnp.ones((100, 32), dtype=jnp.bfloat16),
             "model.norm.weight": jnp.ones((32,), dtype=jnp.bfloat16),
             "model.layers.0.input_layernorm.weight": jnp.ones((32,), dtype=jnp.bfloat16),
-            "model.layers.0.self_attn.q_proj.weight": jnp.ones((32, 32), dtype=jnp.bfloat16),
-            "model.layers.0.mlp.gate_proj.weight": jnp.ones((32, 64), dtype=jnp.bfloat16),
+            "model.layers.0.self_attn.q_proj.weight": jnp.ones((64, 32), dtype=jnp.bfloat16),
+            "model.layers.0.mlp.gate_proj.weight": jnp.ones((64, 32), dtype=jnp.bfloat16),
         }
         params = convert_safetensors_to_jax_params(mock_raw, num_layers=1, first_kv_shared_idx=1)
         self.assertIn("embed_tokens", params)
         self.assertIn("layer_0", params)
         self.assertIn("q_proj", params["layer_0"]["attn"])
+        self.assertEqual(params["layer_0"]["attn"]["q_proj"].shape, (32, 64))
+
+    def test_loader_native_compressed_tensors_layout(self):
+        from ports.gemma4.jax_e_loader import convert_safetensors_to_jax_params
+        mock_raw = {
+            "model.embed_tokens.weight": jnp.ones((100, 32), dtype=jnp.bfloat16),
+            "model.norm.weight": jnp.ones((32,), dtype=jnp.bfloat16),
+            "model.layers.0.input_layernorm.weight": jnp.ones((32,), dtype=jnp.bfloat16),
+            "model.layers.0.post_attention_layernorm.weight": jnp.ones((32,), dtype=jnp.bfloat16),
+            "model.layers.0.self_attn.q_proj.weight_packed": jnp.zeros((64, 4), dtype=jnp.int32),
+            "model.layers.0.self_attn.q_proj.weight_scale": jnp.ones((64, 1), dtype=jnp.bfloat16),
+        }
+        params = convert_safetensors_to_jax_params(
+            mock_raw, num_layers=1, first_kv_shared_idx=1
+        )
+        q = params["layer_0"]["attn"]
+        self.assertEqual(q["q_proj_packed"].shape, (64, 4))
+        self.assertEqual(q["q_proj_scale"].shape, (64, 1))
+        self.assertEqual(q["q_proj_packed"].dtype, jnp.int32)
 
 
 if __name__ == "__main__":
