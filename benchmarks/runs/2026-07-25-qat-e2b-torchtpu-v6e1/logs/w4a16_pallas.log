@@ -1,0 +1,57 @@
+Successfully renamed PrivateUse1 backend to 'tpu'. Device: device(type='tpu')
+Registered Python module for 'tpu'.
+/usr/local/lib/python3.12/dist-packages/torch/_inductor/codecache.py:1074: FutureWarning: `isinstance(treespec, LeafSpec)` is deprecated, use `isinstance(treespec, TreeSpec) and treespec.is_leaf()` instead.
+  yield pickle.loads(content), content, True
+Device type: tpu, Device index: default
+Initializing TPU distributed runtime
+MARKER [15360x3840] fused vs reference max rel diff: 3.704e-03
+MARKER [15360x3840] fused 0.527 ms | in-graph dequant 0.405 ms | dense bf16 0.509 ms | packed bytes/iter 0.03 GB -> fused 56 GB/s eff
+MARKER [3840x15360] fused vs reference max rel diff: 2.033e-03
+Traceback (most recent call last):
+  File "/home/xbill/w4a16_pallas_test.py", line 134, in <module>
+    raise SystemExit(main())
+                     ^^^^^^
+  File "/home/xbill/w4a16_pallas_test.py", line 124, in main
+    t_graph = bench(ref_c, x, packed, scale)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/xbill/w4a16_pallas_test.py", line 94, in bench
+    fn(*args).cpu()  # warmup / compile
+    ^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/_dynamo/eval_frame.py", line 1038, in compile_wrapper
+    raise e.remove_dynamo_frames() from None  # see TORCHDYNAMO_VERBOSE=1
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/_dynamo/output_graph.py", line 2689, in _call_user_compiler
+    raise BackendCompilerFailed(
+  File "/usr/local/lib/python3.12/dist-packages/torch/_dynamo/output_graph.py", line 2664, in _call_user_compiler
+    compiled_fn = compiler_fn(gm, example_inputs)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/_dynamo/repro/after_dynamo.py", line 156, in __call__
+    compiled_gm = compiler_fn(gm, example_inputs)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/__init__.py", line 2535, in __call__
+    return self.compiler_fn(model_, inputs_, **self.kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch_tpu/_internal/compile/_backend.py", line 295, in __call__
+    _raise_on_symint(example_inputs)
+  File "/usr/local/lib/python3.12/dist-packages/torch_tpu/_internal/compile/_backend.py", line 107, in _raise_on_symint
+    return _pytree.tree_map_only(torch.SymInt, _raise, x)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/utils/_pytree.py", line 1715, in tree_map_only
+    return tree_map(map_only(type_or_types_or_pred)(func), tree, is_leaf=is_leaf)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/utils/_pytree.py", line 1539, in tree_map
+    return treespec.unflatten(map(func, *flat_args))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/utils/_pytree.py", line 1280, in unflatten
+    leaves = list(leaves)
+             ^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/utils/_pytree.py", line 1650, in wrapped
+    return func(x)
+           ^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch_tpu/_internal/compile/_backend.py", line 102, in _raise
+    raise NotImplementedError(
+torch._dynamo.exc.BackendCompilerFailed: backend='tpu' raised:
+NotImplementedError: TPU backend: does not support dynamic shape. Please set torch.compile(..., dynamic=False, ...) and try again.
+
+Set TORCHDYNAMO_VERBOSE=1 for the internal stack trace (please do this especially if you're reporting a bug to PyTorch). For even more developer context, set TORCH_LOGS="+dynamo"
+

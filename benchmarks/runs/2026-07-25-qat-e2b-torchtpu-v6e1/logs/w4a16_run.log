@@ -1,0 +1,56 @@
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+I0000 00:00:1785015662.377608   17090 pjrt_api.cc:119] GetPjrtApi was found for TPU at /usr/local/lib/python3.12/dist-packages/libtpu/libtpu.so
+I0000 00:00:1785015662.389486   17090 tpu_profiler_plugin.cc:712] PyTorch PrivateUse1ProfilerRegistry not found. Native TPU profiling will be disabled (this is expected on PyTorch < 2.12).
+I0000 00:00:1785015663.155148   17090 device_rt.cc:125] PjRt runtime initialization deferred for tpu
+Successfully renamed PrivateUse1 backend to 'tpu'. Device: device(type='tpu')
+Registered Python module for 'tpu'.
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+[transformers] `torch_dtype` is deprecated! Use `dtype` instead!
+/usr/local/lib/python3.12/dist-packages/transformers/quantizers/auto.py:271: UserWarning: You passed `quantization_config` or equivalent parameters to `from_pretrained` but the model you're loading already has a `quantization_config` attribute. The `quantization_config` from the model will be used.However, loading attributes (e.g. ['run_compressed']) will be overwritten with the one you passed to `from_pretrained`. The rest will be ignored.
+  warnings.warn(warning_msg)
+Device type: tpu, Device index: default
+Initializing TPU distributed runtime
+Phase 1: reference dequantized load (run_compressed=False, CPU)...
+Compressing model:   0%|          | 0/276 [00:00<?, ?it/s]Compressing model:  27%|██▋       | 75/276 [00:00<00:00, 747.43it/s]Compressing model:  55%|█████▍    | 151/276 [00:00<00:00, 754.45it/s]Compressing model:  82%|████████▏ | 227/276 [00:00<00:00, 756.04it/s]Compressing model: 100%|██████████| 276/276 [00:00<00:00, 755.41it/s]
+Loading weights:   0%|          | 0/2504 [00:00<?, ?it/s]Loading weights:  41%|████      | 1021/2504 [00:00<00:00, 10205.75it/s]Loading weights:  82%|████████▏ | 2042/2504 [00:00<00:00, 9162.81it/s] Loading weights: 100%|██████████| 2504/2504 [00:00<00:00, 9342.65it/s]
+Decompressing model:   0%|          | 0/276 [00:00<?, ?it/s]Decompressing model:   9%|▊         | 24/276 [00:00<00:01, 221.48it/s]Decompressing model:  18%|█▊        | 50/276 [00:00<00:00, 236.03it/s]Decompressing model:  28%|██▊       | 77/276 [00:00<00:00, 242.54it/s]Decompressing model:  38%|███▊      | 104/276 [00:00<00:00, 245.28it/s]Decompressing model:  47%|████▋     | 130/276 [00:00<00:00, 249.53it/s]Decompressing model:  56%|█████▌    | 155/276 [00:00<00:00, 189.90it/s]Decompressing model:  64%|██████▍   | 176/276 [00:00<00:00, 163.90it/s]Decompressing model:  70%|███████   | 194/276 [00:01<00:00, 153.62it/s]Decompressing model:  76%|███████▋  | 211/276 [00:01<00:00, 142.10it/s]Decompressing model:  82%|████████▏ | 226/276 [00:01<00:00, 139.29it/s]Decompressing model:  87%|████████▋ | 241/276 [00:01<00:00, 135.72it/s]Decompressing model:  92%|█████████▏| 255/276 [00:01<00:00, 133.53it/s]Decompressing model:  97%|█████████▋| 269/276 [00:01<00:00, 130.20it/s]Decompressing model: 100%|██████████| 276/276 [00:01<00:00, 161.90it/s]
+MARKER ref weight model.language_model.layers.0.mlp.gate_proj: (6144, 1536) torch.bfloat16
+Phase 2: packed load (run_compressed=True, CPU) + module swap...
+Compressing model:   0%|          | 0/276 [00:00<?, ?it/s]Compressing model:  28%|██▊       | 76/276 [00:00<00:00, 756.20it/s]Compressing model:  55%|█████▌    | 153/276 [00:00<00:00, 762.91it/s]Compressing model:  83%|████████▎ | 230/276 [00:00<00:00, 764.75it/s]Compressing model: 100%|██████████| 276/276 [00:00<00:00, 763.29it/s]
+Loading weights:   0%|          | 0/2504 [00:00<?, ?it/s]Loading weights:  38%|███▊      | 954/2504 [00:00<00:00, 9538.19it/s]Loading weights:  76%|███████▌  | 1908/2504 [00:00<00:00, 8802.95it/s]Loading weights: 100%|██████████| 2504/2504 [00:00<00:00, 9063.71it/s]
+I0000 00:00:1785015671.802014   17090 pjrt_api.cc:168] The PJRT plugin has PJRT API version 0.113. The framework PJRT API version is 0.113.
+I0000 00:00:1785015673.160078   17090 pjrt_c_api_client.cc:201] PjRtCApiClient created.
+I0000 00:00:1785015676.319309   17358 tier2_compilation_cache.cc:149] Tier-2 compilation cache is disabled for world size 1.
+I0000 00:00:1785015676.319357   17358 tier3_compilation_cache.cc:65] Backup compilation for tier-3 cache read is disabled as tier-3 cache is disabled.
+MARKER compressed module type: Linear
+MARKER   weight_scale: (6144, 48) torch.bfloat16
+MARKER   weight_packed: (6144, 192) torch.int32
+MARKER   weight_shape: (2,) torch.int64
+MARKER swapped 276 modules in 1.5s; packed+scale = 1.06 GB vs bf16 3.75 GB (3.56x smaller)
+Phase 3: CPU bit-exactness check vs reference dequant...
+MARKER cpu dequant max abs diff vs reference: 0.0
+Phase 4: TPU eager dequant check...
+MARKER tpu eager dequant max abs diff: 0.0
+Phase 5: compiled static-shape decode bench...
+Warmup (4 steps, includes compile)...
+Decompressing model: 0it [00:00, ?it/s]Decompressing model: 0it [00:00, ?it/s]
+/usr/local/lib/python3.12/dist-packages/torch/_dynamo/utils.py:3895: UserWarning: TorchTPU only supports FLASH_ATTENTION SDPBackend for scaled_dot_product_attention when these conditions are met:
+- attn_mask is None (current: present)
+- dropout_p is 0.0 (current: 0)
+- inputs are float32 or bfloat16 (current: BFloat16)
+- inputs have the same rank (query: 4, key: 4, value: 4)
+- query rank is at least 4 (current: 4)
+- batch size is at least 1 (current: 1)
+- Sequence lengths (dim - 2) are divisible by 512 (query: 256, key: 256, value: 256)
+- Head dimension (dim - 1) is less than 128 or divisible by 128 (query: 256) (Triggered internally at torch_tpu/ops/scaled_dot_product_attention/scaled_dot_product_attention_aten_kernels.cc:400.)
+  return node.target(*args, **kwargs)  # type: ignore[operator]
+MARKER warmup done in 57.1s
+--- output -------------------------------------------------
+TPUs are fast because they are specifically designed for the massive parallel computations required by machine learning, utilizing specialized hardware optimized for matrix multiplications. This architecture allows them to process vast amounts of data simultaneously, leading to significantly faster training and inference times compared to traditional CPUs.
+------------------------------------------------------------
+MARKER packed w4a16 compiled decode (SEQ=256, no KV cache): 64 steps in 0.41s = 157.5 tok/s (6.3 ms/step)
+I0000 00:00:1785015735.422930   17090 compilation_cache.cc:345] Compilation cache evicted.
+I0000 00:00:1785015735.423006   17090 compilation_cache.cc:209] CompilationCache final stats: num_cache_reqs=283
+num_cache_hits=270 {95.4%}
+peak_compilation_memory_bytes=unknown
+
