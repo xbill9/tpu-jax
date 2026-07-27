@@ -111,6 +111,20 @@ class TestGemma4EJAX(unittest.TestCase):
         jit_logits = jit_forward(input_ids, params, position_ids, quant_mode="fp16")
         self.assertEqual(jit_logits.shape, (1, 3, self.config.vocab_size))
 
+    def test_loader_mapping(self):
+        from ports.gemma4.jax_e_loader import convert_safetensors_to_jax_params
+        mock_raw = {
+            "model.embed_tokens.weight": jnp.ones((100, 32), dtype=jnp.bfloat16),
+            "model.norm.weight": jnp.ones((32,), dtype=jnp.bfloat16),
+            "model.layers.0.input_layernorm.weight": jnp.ones((32,), dtype=jnp.bfloat16),
+            "model.layers.0.self_attn.q_proj.weight": jnp.ones((32, 32), dtype=jnp.bfloat16),
+            "model.layers.0.mlp.gate_proj.weight": jnp.ones((32, 64), dtype=jnp.bfloat16),
+        }
+        params = convert_safetensors_to_jax_params(mock_raw, num_layers=1, first_kv_shared_idx=1)
+        self.assertIn("embed_tokens", params)
+        self.assertIn("layer_0", params)
+        self.assertIn("q_proj", params["layer_0"]["attn"])
+
 
 if __name__ == "__main__":
     unittest.main()
