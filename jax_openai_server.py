@@ -21,11 +21,22 @@ from pydantic import BaseModel, Field
 
 import jax
 import jax.numpy as jnp
+
+# Enable native TPU MXU bfloat16 matmul precision
+jax.config.update("jax_default_matmul_precision", "bfloat16")
+
+# Enable persistent JAX XLA Compilation Disk Cache (skips ~17s compile overhead on restarts)
+_cache_dir = os.path.expanduser("~/.cache/jax_compilation_cache")
+os.makedirs(_cache_dir, exist_ok=True)
+jax.config.update("jax_compilation_cache_dir", _cache_dir)
+jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
+import json
+from threading import Thread
 import transformers
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import PlainTextResponse, StreamingResponse
 import uvicorn
 
 # Global state for JAX model & tokenizer
@@ -57,11 +68,13 @@ class ChatCompletionRequest(BaseModel):
     messages: List[ChatMessage]
     max_tokens: Optional[int] = 128
     temperature: Optional[float] = 0.7
+    stream: Optional[bool] = False
 
 class CompletionRequest(BaseModel):
     model: Optional[str] = MODEL_ID
     prompt: Union[str, List[str]]
     max_tokens: Optional[int] = 128
+    stream: Optional[bool] = False
 
 def fetch_hf_token():
     if os.environ.get("HF_TOKEN"):
@@ -199,6 +212,48 @@ def chat_completions(req: ChatCompletionRequest):
         inputs = TOKENIZER(prompt_text, return_tensors="pt")
         prompt_tokens = inputs["input_ids"].shape[1]
 
+        if req.stream:
+            streamer = TextIteratorStreamer(TOKENIZER, skip_prompt=True, skip_special_tokens=True)
+            gen_kwargs = dict(inputs, streamer=streamer, max_new_tokens=req.max_tokens or 128, do_sample=False)
+            thread = Thread(target=MODEL.generate, kwargs=gen_kwargs)
+            thread.start()
+
+            def chat_sse_generator():
+                req_id = f"chatcmpl-jax-{int(time.time() * 1000)}"
+                created = int(time.time())
+                total_gen_tokens = 0
+                for token_text in streamer:
+                    total_gen_tokens += 1
+                    chunk = {
+                        "id": req_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": req.model or MODEL_ID,
+                        "choices": [{"index": 0, "delta": {"content": token_text}, "finish_reason": None}]
+                    }
+                    yield f"data: {json.dumps(chunk)}\n\n"
+                
+                elapsed = time.time() - t0
+                tok_per_sec = total_gen_tokens / max(elapsed, 0.001)
+                METRICS["successful_requests"] += 1
+                METRICS["prompt_tokens_total"] += prompt_tokens
+                METRICS["completion_tokens_total"] += total_gen_tokens
+                METRICS["total_latency_seconds"] += elapsed
+                METRICS["last_tokens_per_second"] = tok_per_sec
+
+                final_chunk = {
+                    "id": req_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": req.model or MODEL_ID,
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+                }
+                yield f"data: {json.dumps(final_chunk)}\n\n"
+                yield "data: [DONE]\n\n"
+
+            return StreamingResponse(chat_sse_generator(), media_type="text/event-stream")
+
+        # Non-streaming response
         with torch.no_grad():
             output_ids = MODEL.generate(**inputs, max_new_tokens=req.max_tokens or 128, do_sample=False)
 
@@ -249,6 +304,48 @@ def text_completions(req: CompletionRequest):
         inputs = TOKENIZER(prompt_text, return_tensors="pt")
         prompt_tokens = inputs["input_ids"].shape[1]
 
+        if req.stream:
+            streamer = TextIteratorStreamer(TOKENIZER, skip_prompt=True, skip_special_tokens=True)
+            gen_kwargs = dict(inputs, streamer=streamer, max_new_tokens=req.max_tokens or 128, do_sample=False)
+            thread = Thread(target=MODEL.generate, kwargs=gen_kwargs)
+            thread.start()
+
+            def text_sse_generator():
+                req_id = f"cmpl-jax-{int(time.time() * 1000)}"
+                created = int(time.time())
+                total_gen_tokens = 0
+                for token_text in streamer:
+                    total_gen_tokens += 1
+                    chunk = {
+                        "id": req_id,
+                        "object": "text_completion",
+                        "created": created,
+                        "model": req.model or MODEL_ID,
+                        "choices": [{"text": token_text, "index": 0, "finish_reason": None}]
+                    }
+                    yield f"data: {json.dumps(chunk)}\n\n"
+
+                elapsed = time.time() - t0
+                tok_per_sec = total_gen_tokens / max(elapsed, 0.001)
+                METRICS["successful_requests"] += 1
+                METRICS["prompt_tokens_total"] += prompt_tokens
+                METRICS["completion_tokens_total"] += total_gen_tokens
+                METRICS["total_latency_seconds"] += elapsed
+                METRICS["last_tokens_per_second"] = tok_per_sec
+
+                final_chunk = {
+                    "id": req_id,
+                    "object": "text_completion",
+                    "created": created,
+                    "model": req.model or MODEL_ID,
+                    "choices": [{"text": "", "index": 0, "finish_reason": "stop"}]
+                }
+                yield f"data: {json.dumps(final_chunk)}\n\n"
+                yield "data: [DONE]\n\n"
+
+            return StreamingResponse(text_sse_generator(), media_type="text/event-stream")
+
+        # Non-streaming response
         with torch.no_grad():
             output_ids = MODEL.generate(**inputs, max_new_tokens=req.max_tokens or 128, do_sample=False)
 

@@ -21,7 +21,18 @@ if _REPO_ROOT not in sys.path:
 import jax
 import jax.numpy as jnp
 
-from ports.gemma4.jax_e_model import Gemma4EConfig, Gemma4EModelJAX, qat_w4a16_unpack_dequant_jax
+from ports.gemma4.jax_e_model import (
+    Gemma4EConfig,
+    Gemma4EModelJAX,
+    qat_w4a16_unpack_dequant_jax,
+    qat_w4a16_pallas_matmul_jax,
+    init_kv_cache,
+    init_paged_kv_cache,
+    generate_n_tokens_scan,
+    TPUv6eHardwareProfile,
+    pad_to_tpu_v6e_bucket,
+    onchip_sample_tpu_v6e_jax,
+)
 
 
 def run_e2e_smoke_test():
@@ -102,7 +113,27 @@ def run_e2e_smoke_test():
     # 3. Model initialization
     model = Gemma4EModelJAX(config)
 
-    # 4. Prefill test (Prompt: sequence of 16 tokens)
+    # 4. FP8 Static & Paged KV Cache Initialization Test
+    fp8_cache = init_kv_cache(config, batch_size=1, max_seq_len=2048, dtype=jnp.float8_e4m3fn)
+    paged_cache = init_paged_kv_cache(config, num_blocks=512, block_size=16, batch_size=1, dtype=jnp.float8_e4m3fn)
+    print(f"✓ Static FP8 KV Cache preallocated for {len(fp8_cache)} non-shared layers (dtype=fp8_e4m3fn)")
+    print(f"✓ PagedAttention Block Cache initialized for {len(paged_cache)} layers (512 blocks x 16 tokens/block)")
+
+    # 4b. Pallas Fused W4A16 Dequant-Matmul Kernel Test
+    sample_x = jax.random.normal(jax.random.PRNGKey(42), (16, config.hidden_size), dtype=jnp.bfloat16)
+    sample_packed = params["layer_0"]["attn"]["q_proj_packed"]
+    sample_scale = params["layer_0"]["attn"]["q_proj_scale"]
+    pallas_out = qat_w4a16_pallas_matmul_jax(sample_x, sample_packed, sample_scale)
+    assert pallas_out.shape == (16, config.num_attention_heads * config.head_dim)
+    print("✓ Pallas fused W4A16 VMEM dequant-matmul kernel execution verified")
+
+    # 4c. TPU v6e Static Bucket Padding Test
+    dummy_input = jnp.array([[101, 2054, 2003, 1037, 2742]], dtype=jnp.int32)
+    padded_input, mask = pad_to_tpu_v6e_bucket(dummy_input)
+    assert padded_input.shape[1] == 64  # Padded to nearest 128-aligned static bucket (64)
+    print(f"✓ Static 128-aligned bucket padding verified: Input len 5 -> padded bucket len {padded_input.shape[1]}")
+
+    # 5. Prefill test (Prompt: sequence of 16 tokens)
     prompt_len = 16
     input_ids = jnp.array([[101, 2054, 2003, 1037, 2742, 2000, 2022, 2172, 2005, 1037, 3054, 2000, 2022, 2172, 2005, 1037]], dtype=jnp.int32)
     position_ids = jnp.arange(prompt_len, dtype=jnp.int32)[None, :]
@@ -113,6 +144,12 @@ def run_e2e_smoke_test():
     duration = (time.time() - start) * 1000
     print(f"✓ Uncompiled forward complete: Logits shape = {logits.shape}, Latency = {duration:.2f} ms")
 
+    # Vectorized On-Chip TPU Top-K Sampling Test over 262,144 vocab
+    sample_key = jax.random.PRNGKey(99)
+    sample_token = onchip_sample_tpu_v6e_jax(logits[:, -1, :], sample_key, temperature=0.7, top_k=40)
+    assert sample_token.shape == (1, 1)
+    print("✓ On-chip TPU Top-K sampling (over 262,144 vocab) verified")
+
     # Sanity checks on output logits
     assert logits.shape == (1, prompt_len, config.vocab_size), f"Unexpected shape {logits.shape}"
     assert not jnp.isnan(logits).any(), "Logits contain NaN!"
@@ -120,7 +157,7 @@ def run_e2e_smoke_test():
     assert float(jnp.max(jnp.abs(logits))) <= 30.0, "Logit softcapping bound (>30.0) violated!"
     print("✓ Output logits passed sanity checks (non-NaN, non-Inf, softcapped <= 30.0)")
 
-    # 5. JIT compilation test
+    # 6. JIT compilation test
     print("\n--- JAX JIT Compilation Test ---")
     jit_model = jax.jit(model, static_argnames=("quant_mode",))
 
@@ -134,21 +171,29 @@ def run_e2e_smoke_test():
     exec_duration = (time.time() - start) * 1000
     print(f"✓ Second JIT run (cached graph): Latency = {exec_duration:.2f} ms")
 
-    # 6. Autoregressive token generation loop (5 steps)
-    print("\n--- Autoregressive Decoding Loop (5 steps) ---")
-    curr_ids = input_ids
-    generated_tokens = []
+    # 7. Fused jax.lax.scan N-token Generation Benchmark
+    print("\n--- Fused jax.lax.scan On-Chip Token Generation (32 tokens) ---")
+    jit_scan_gen = jax.jit(generate_n_tokens_scan, static_argnames=("model", "num_steps", "quant_mode"))
 
-    for step in range(5):
-        seq_len = curr_ids.shape[1]
-        pos_ids = jnp.arange(seq_len, dtype=jnp.int32)[None, :]
-        step_logits = jit_model(curr_ids, params, pos_ids, quant_mode="w4a16")
-        next_token = int(jnp.argmax(step_logits[0, -1, :]))
-        generated_tokens.append(next_token)
-        curr_ids = jnp.concatenate([curr_ids, jnp.array([[next_token]], dtype=jnp.int32)], axis=1)
-        print(f"  Step {step + 1}: Generated token ID = {next_token}")
+    start = time.time()
+    scanned_tokens = jit_scan_gen(model, input_ids, params, num_steps=32, quant_mode="w4a16").block_until_ready()
+    scan_compile_dur = (time.time() - start) * 1000
+    print(f"✓ First JIT scan compile & generate 32 tokens: Latency = {scan_compile_dur:.2f} ms")
 
-    print(f"✓ Generated sequence extension: {generated_tokens}")
+    start = time.time()
+    scanned_tokens2 = jit_scan_gen(model, input_ids, params, num_steps=32, quant_mode="w4a16").block_until_ready()
+    scan_exec_dur = (time.time() - start) * 1000
+    print(f"✓ Second JIT scan run (32 tokens): Latency = {scan_exec_dur:.2f} ms ({scan_exec_dur / 32:.2f} ms/token, {32000.0 / scan_exec_dur:.1f} tok/s)")
+    print(f"  Generated tokens shape: {scanned_tokens2.shape}")
+
+    # 8. Batched Inference Benchmark (B = 2)
+    print("\n--- Batched Inference Benchmark (B = 2) ---")
+    batched_ids = jnp.repeat(input_ids, 2, axis=0)  # Shape [2, 16]
+    start = time.time()
+    batched_out = jit_scan_gen(model, batched_ids, params, num_steps=16, quant_mode="w4a16").block_until_ready()
+    batched_dur = (time.time() - start) * 1000
+    print(f"✓ Batched B=2 scan generation (16 tokens x 2 streams = 32 total tokens): Latency = {batched_dur:.2f} ms ({32000.0 / batched_dur:.1f} aggregate tok/s)")
+
     print("\n" + "=" * 70)
     print("🎉 GEMMA 4 E2B QAT JAX END-TO-END SMOKE TEST SUCCESSFUL!")
     print("=" * 70)
