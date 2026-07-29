@@ -1,144 +1,180 @@
-# 🚀 tpu-skill-claude — TPU Management Skill & MCP Agent
+# Gemma 4 E2B QAT on a Single TPU with Pure JAX
 
-This repository packages the **`tpu-management` Claude Code skill** and the **`tpu-devops` MCP server**: an AI DevOps/SRE agent for operating Google Cloud TPU capacity, **Gemma 4** vLLM serving, and bare **JAX** dev VMs on TPU. It finds and provisions TPU capacity (flex-start VMs, queued resources), starts and debugs vLLM, provisions JAX dev VMs (`workload="jax"`), verifies model health, runs benchmarks, analyzes logs with the self-hosted Gemma 4 model, and tears everything down safely.
+This repository is an experimental, inspectable inference path for
+`google/gemma-4-E2B-it-qat-w4a16-ct` on one Cloud TPU v6e-1. It loads the QAT
+checkpoint directly from safetensors, executes Gemma 4 in JAX without PyTorch,
+and exposes an OpenAI-compatible HTTP/SSE server.
 
-**GitHub:** https://github.com/xbill9/tpu-skill-claude
+The project began with a practical incompatibility: the tested vLLM TPU stack
+could not load this QAT export. Building the missing path uncovered a broader
+measurement story about KV-cache accounting, JAX buffer donation, quantization,
+static-shape batching, and the gap between a fast kernel and a useful server.
 
----
+## What is verified
 
-## ⚡ Quick Start — set up a project in one command
+- The QAT checkpoint loads without PyTorch in the path.
+- Cached decode matches full-sequence re-forward within float32 tolerance.
+- Padding to 128-aligned TPU buckets does not change model output.
+- INT8 KV attention matches a dequantize-first reference.
+- Chunked prefill is token-exact against one-shot prefill.
+- Greedy SSE and non-streaming HTTP responses produce identical text.
+- CPU tests use a tiny synthetic checkpoint; TPU claims were measured on
+  `ct6e-standard-1t` with 32 GB HBM3.
 
-`project-setup.sh` installs the `tpu-management` skill **and** registers the `tpu-devops` MCP server for any project (idempotent — re-run to refresh):
+## Corrected v6e-1 results
 
-```bash
-./project-setup.sh /path/to/project --project <gcp-project-id>   # one project (.mcp.json + .claude/skills)
-./project-setup.sh --global                                      # all projects (~/.claude/skills + user-scope MCP)
-make init TARGET=/path/to/project ARGS='--project <id>' # same, refreshing skill snapshots first
-```
+The final 2026-07-29 revalidation used checkpoint-shaped static programs,
+isolated processes, warmup, and 15 timed samples.
 
-It uses the system `python3` (warning with a `pip install -r requirements.txt` hint if server dependencies are missing — it never creates a venv), merges the server entry into the project's `.mcp.json` without touching other servers, and prints the remaining manual steps (restart Claude Code, gcloud auth, HF token). See `./project-setup.sh --help` for all options. The installer is also bundled inside the skill itself (`mcp/project-setup.sh`), so an unzipped `dist/tpu-management-skill.zip` is self-installing.
-
-This repo's **own** `.mcp.json` is gitignored (it embeds your GCP project id) and is generated automatically: `./init.sh` registers the server on first run (leaving an existing entry untouched), or regenerate it any time with `./project-setup.sh . --project <gcp-project-id> [--model ... --accelerator ... --tp ...]`.
-
----
-
-## 📦 Installing the `tpu-management` Skill
-
-Claude Code auto-discovers any skill folder containing a `SKILL.md` in two places:
-
-- **Project-level:** `<project>/.claude/skills/tpu-management/` — available only in that project (this repo ships its own copy, so working inside this repo needs no install).
-- **User-level:** `~/.claude/skills/tpu-management/` — available in every project on the machine.
-
-Pick the install path that fits:
-
-| Goal | Command |
+| Finding | Measured result |
 | :--- | :--- |
-| This machine, all projects | `make skill-install` |
-| One specific project (skill **and** `tpu-devops` MCP server) | `make init TARGET=/path/to/project ARGS='--project <gcp-project-id>'` |
-| All projects + user-scope MCP registration | `make init ARGS='--global'` |
-| Another machine | `make skill-package`, copy `dist/tpu-management-skill.zip`, unzip into `~/.claude/skills/` |
+| Buffer donation | **1.60–1.62×** faster with BF16 KV |
+| INT8 KV | **1.17–1.19×** faster than donated BF16 |
+| INT8 KV capacity | **1.82–1.98×** donated BF16 capacity |
+| INT4 PLE | Parameter tree **53% smaller**; no meaningful throughput gain |
+| Best static decode kernel | **2,888 aggregate tok/s**, B=32, context 8,192 |
+| Real-checkpoint HTTP server | Approximately **139–141 aggregate tok/s** |
 
-### Install from GitHub
+The largest optimization was buffer donation. Without `donate_argnums`, a
+single-token `dynamic_update_slice` could leave two full KV caches live during
+decode. Donation removed that copy, increased throughput, and nearly doubled
+the resident-token ceiling.
 
-**Option A — Claude Code plugin marketplace (recommended):**
+INT8 KV then reduced bandwidth and approximately doubled capacity. Its real
+checkpoint quality check measured 28.41 versus 28.73 perplexity for BF16, with
+97.08% greedy-token agreement over 583 teacher-forced steps. Error did not grow
+through a separate 968-step continuous decode.
 
-```
-/plugin marketplace add xbill9/tpu-skill-claude
-/plugin install tpu-management@tpu-skill-claude
-```
+Read the correction history before quoting an absolute capacity number:
+[`benchmarks/runs/2026-07-29-kv-quant-v6e1/REPORT.md`](benchmarks/runs/2026-07-29-kv-quant-v6e1/REPORT.md).
+Earlier results were withdrawn after finding an artificial power-of-two capacity
+invariant, an undonated cache copy, and an incorrect roofline accounting of the
+PLE gather.
 
-This installs the `tpu-management` skill **and** registers the `tpu-devops` MCP server in one step, with updates managed by Claude Code (`/plugin` → manage/update). Configure the server through environment variables (e.g. `GOOGLE_CLOUD_PROJECT`, `MODEL_NAME`, `ACCELERATOR_TYPE`) — see `SKILL.md` or the `get_help` tool for the full list.
+## Kernel speed is not serving speed
 
-**Option B — clone and install** (all projects on this machine):
+The 2,888 tok/s point is a static-shape decode-kernel measurement using
+architecture-shaped synthetic parameter values. Static values do not change the
+compiled work, but this is not an HTTP benchmark or a direct vLLM comparison.
 
-```bash
-git clone https://github.com/xbill9/tpu-skill-claude
-cd tpu-skill-claude
-make skill-install                                   # skill only
-./project-setup.sh --global                          # skill + user-scope tpu-devops MCP server
-```
+The real checkpoint served through `jax_openai_server.py` measured:
 
-**Option C — zip install, no clone** (straight from the packaged zip):
+| Prompt tokens | Prefill | Decode |
+| ---: | ---: | ---: |
+| 506 | 9.3 ms | 141.1 tok/s |
+| 2,045 | 32.0 ms | 140.5 tok/s |
+| 7,679 | 318.6 ms | 138.5 tok/s |
 
-```bash
-curl -L -o /tmp/tpu-management-skill.zip \
-  https://github.com/xbill9/tpu-skill-claude/raw/main/dist/tpu-management-skill.zip
-mkdir -p ~/.claude/skills && unzip -o /tmp/tpu-management-skill.zip -d ~/.claude/skills/
-~/.claude/skills/tpu-management/mcp/project-setup.sh --global   # optional: register the MCP server
-```
+At HTTP concurrency 2/4/8, aggregate throughput remained
+128.7/133.6/143.3 tok/s while median request latency rose
+497/952/1,775 ms. Every request succeeded, but none formed a device batch.
 
-All of these first run `make skill` (`refresh_skill.py`), which regenerates the bundled snapshots from the repo-root sources: `server.py`, `project-setup.sh`, and `requirements.txt` are copied into the skill's `mcp/` folder, and `references/tpu-guide.md` is rebuilt from `tpu.md` with the embedded screenshots stripped. `SKILL.md` and the `mcp/startup_script*_template.sh` scripts are hand-maintained and never overwritten.
+The current server runs independent B=1 executions. Reaching the batched-kernel
+rate requires a request batcher, batched KV ownership, continuous admission, and
+prefix reuse. Until then, this is a validated experimental engine—not a vLLM
+replacement. Full results:
+[`benchmarks/runs/2026-07-29-real-http-v6e1/REPORT.md`](benchmarks/runs/2026-07-29-real-http-v6e1/REPORT.md).
 
-After installing (or updating), **restart Claude Code** or start a new session so it picks up the skill. Verify with `/skills` — `tpu-management` should be listed.
-
-Because installs are refresh-and-copy (not symlinks), an installed copy goes stale when `server.py`, `tpu.md`, or `SKILL.md` changes — rerun `make skill-install` (or `make init ...`) after editing those files.
-
----
-
-## 📂 Repository Layout
+## Repository map
 
 | Path | Purpose |
 | :--- | :--- |
-| `server.py` | The `tpu-devops` FastMCP server — the authoritative source (full tool catalog in `SKILL.md` / the `get_help` tool) |
-| `project-setup.sh` | One-command installer: skill + MCP registration for a target project |
-| `refresh_skill.py` | Regenerates the bundled skill snapshots from the repo-root sources |
-| `requirements.txt` | Python dependencies for the MCP server |
-| `Makefile` | `skill` / `skill-install` / `skill-package` / `init` targets (see below) |
-| `.claude/skills/tpu-management/` | Project-level skill: `SKILL.md`, `mcp/` (server snapshot, installer, startup script template), `references/tpu-guide.md` |
-| `.claude-plugin/` | `plugin.json` + `marketplace.json` — the repo doubles as a Claude Code plugin marketplace |
-| `skills/tpu-management/` | Plugin-layout copy of the skill (synced by `make skill`) |
-| `dist/tpu-management-skill.zip` | Packaged skill for zip installs (built by `make skill-package`) |
-| `init.sh`, `set_env.sh`, `set_adc.sh` | GCP environment / credentials setup helpers |
-| `tpu.md` | TPU getting started guide source (gitignored; the stripped, vendor-neutral text copy ships in `references/tpu-guide.md`) |
+| `ports/gemma4/jax_e_model.py` | Gemma 4 E2B forward, cached decode, quantized KV, and Pallas experiments |
+| `ports/gemma4/jax_e_loader.py` | Torch-free safetensors/QAT loader |
+| `ports/gemma4/jax_e_benchmark_sweep_v2.py` | Corrected prefill and cached-decode benchmark |
+| `jax_engine.py` | Stateful generation engine |
+| `jax_openai_server.py` | OpenAI-compatible completions, chat, SSE, health, and metrics |
+| `tests/` | CPU correctness and API regression suite |
+| `benchmarks/runs/` | Raw logs, JSON, scripts, reports, and correction notes |
+| `benchmarks/queued/` | Hardware profiling and queued benchmark utilities |
 
----
+## Run the engine
 
-## 🛠 Features & Capabilities
-
-The `tpu-devops` MCP server covers the full TPU serving lifecycle (catalog with usage guidance in [SKILL.md](.claude/skills/tpu-management/SKILL.md), live listing via the `get_help` tool):
-
-- **Capacity discovery & provisioning:** sweep zones for available capacity (`find_tpu_vm` for flex-start VMs, `find_tpu` for queued resources), check quotas (`get_zones_with_available_quota`), estimate cost, create flex-start TPU VMs (v6e/v5p) or legacy queued resources (v5e) with an auto-serving startup script, then `wait_for_vllm_ready` until the model is up.
-- **Serving stack control:** manage the vLLM Docker container (`manage_vllm_docker` — works on both flex-start VMs and queued-resource nodes), fetch endpoints and the gcloud deployment one-liner, store the HF token in Secret Manager.
-- **Health, logs & diagnostics:** system status dashboard covering both serving paths, model health verification, vLLM/docker/system/serial logs, Cloud Logging retrieval, and Gemma-4-powered log triage (`analyze_cloud_logging`).
-- **Inference & benchmarking:** query the deployed Gemma 4 endpoint (optional TTFT/throughput stats), run `vllm bench serve` for benchmark metrics.
-- **Universal SRE help:** a standardized `get_help` tool describing the active configuration and all exposed tools.
-
----
-
-## 🏗 Makefile Usage
+Use a TPU VM with a current `jax[tpu]` installation and authenticated access to
+the gated Gemma checkpoint. Install the HTTP and checkpoint dependencies, then:
 
 ```bash
-make skill         # Refresh skill snapshots from server.py / tpu.md (also syncs the plugin copy in skills/)
-make skill-install # Refresh + copy the skill to ~/.claude/skills (all projects)
-make skill-package # Refresh + build dist/tpu-management-skill.zip
-make init TARGET=/path/to/project [ARGS='--project my-gcp-id']
-                   # Refresh + install skill AND register the tpu-devops MCP server
+python3 jax_openai_server.py \
+  --model google/gemma-4-E2B-it-qat-w4a16-ct \
+  --kv-cache-dtype int8 \
+  --quant-mode w4a16 \
+  --max-model-len 8192 \
+  --port 8000
 ```
 
-Edit the repo-root sources (`server.py`, `tpu.md`, `project-setup.sh`), then run the appropriate target — never edit the snapshot copies directly.
+Query the streaming endpoint:
 
----
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "google/gemma-4-E2B-it-qat-w4a16-ct",
+    "messages": [{"role": "user", "content": "Explain TPU buffer donation."}],
+    "stream": true
+  }'
+```
 
-## ⚙️ Configuration
+Run the corrected kernel sweep:
 
-The server reads its configuration from environment variables: `GOOGLE_CLOUD_PROJECT` (falls back to the active gcloud config), `GOOGLE_CLOUD_ZONE` (default `europe-west4-a`), `GOOGLE_CLOUD_REGION`, `MODEL_NAME`, `ACCELERATOR_TYPE`, `TENSOR_PARALLEL_SIZE`. Prerequisites: `pip install -r requirements.txt`, an authenticated `gcloud` CLI with alpha components, the TPU API enabled, and — for vLLM serving only — a Hugging Face token stored as Secret Manager secret `hf-token` (the `save_hf_token` tool does this for you).
+```bash
+python3 ports/gemma4/jax_e_benchmark_sweep_v2.py \
+  --batch-sizes 1,2,4,8,16,32,64 \
+  --contexts 8,128,512,2048 \
+  --json-out results.json
+```
 
----
+Run CPU correctness tests:
 
-## 🔒 Security & Credentials
+```bash
+python3 -m unittest discover -s tests
+```
 
-When deploying to Google Cloud or Hugging Face, secure credentials using:
-- **Hugging Face Access Token:** Saved locally or to Google Secret Manager.
-- **Application Default Credentials (ADC):** Set up using GCP credentials helper scripts (`set_adc.sh`).
+CPU is suitable for numerical correctness, scheduling, endpoint, and SSE tests.
+It cannot validate TPU throughput, HBM capacity, compilation timing, or
+Pallas/Mosaic performance.
 
-## 📖 Related Documentation
+## Current limitations
 
-- [SKILL.md](.claude/skills/tpu-management/SKILL.md) — the skill itself: lifecycle, tool catalog, required vLLM flags, field notes, cautions
-- [GEMINI.md](GEMINI.md) — Gemini CLI integration via a LiteLLM proxy pointed at the self-hosted Gemma 4 TPU endpoint
-- `references/tpu-guide.md` — TPU getting started guide: flex-start zones, quotas, troubleshooting
+- No continuous batching or prefix cache.
+- Static `(batch, sequence)` shapes can trigger first-touch compilation.
+- Chunked prefill improves admission but does not yet compose with ring-buffer
+  windowing.
+- Greedy decoding is implemented; production grammar-constrained tool output is
+  not.
+- The Pallas W4A16 experiment regressed performance and is not the recommended
+  path.
+- Results describe this implementation and workload, not the v6e hardware limit.
 
-## Credits
+## Supporting TPU infrastructure
 
-Google Cloud credits are provided for this project.
+The repository also retains the `tpu-management` skill and `tpu-devops` MCP
+server used to provision flex-start TPU VMs, verify JAX devices, inspect logs,
+run vLLM baselines, and clean up capacity:
 
-#AgenticArchitect #GoogleAntigravity
+```bash
+./project-setup.sh /path/to/project --project <gcp-project-id>
+make skill
+make skill-install
+```
+
+See [SKILL.md](.claude/skills/tpu-management/SKILL.md) for the infrastructure
+tool catalog. Root sources (`server.py`, `project-setup.sh`, and `tpu.md`) remain
+authoritative; generated skill snapshots are refreshed with `make skill`.
+
+## Results and writing
+
+- [Corrected TPU report](benchmarks/runs/2026-07-29-kv-quant-v6e1/REPORT.md)
+- [Real-weight HTTP report](benchmarks/runs/2026-07-29-real-http-v6e1/REPORT.md)
+- [vLLM baseline](benchmarks/reports/2026-07-21-gemma4-e2b-v6e1.json)
+- [Long-form article draft](devto-jax-gemma4-e2b.md)
+- [Hugging Face benchmark dataset](https://huggingface.co/datasets/xbill9/gemma4-e2b-tpu-v6e-benchmarks)
+
+The Hugging Face dataset is currently private. It contains reports, raw JSON,
+benchmark scripts, and the article, but no model weights or credentials.
+
+## Security
+
+Never commit Hugging Face tokens, GCP credentials, model caches, or generated
+server logs. Use scoped credentials and Google Secret Manager for remote TPU
+deployments. The upstream Gemma checkpoint remains governed by its own access
+and license terms.
