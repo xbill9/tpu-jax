@@ -6,7 +6,7 @@ repo measures, and they both corroborate and challenge our results.
 
 | # | DOI | Title | Hardware |
 | --- | --- | --- | --- |
-| 1–2 | [10.5281/zenodo.21221952](https://doi.org/10.5281/zenodo.21221952) | From 1,540 to 19,511 Tokens per Second on a Single TPU v5e Chip | v5e ×1, Gemma 2B |
+| 1–2 | [10.5281/zenodo.21212010](https://doi.org/10.5281/zenodo.21212010) | From 1,540 to 19,511 Tokens per Second on a Single TPU v5e Chip | v5e ×1, Gemma 2B |
 | 3 | [10.5281/zenodo.21227936](https://doi.org/10.5281/zenodo.21227936) | Token Velocity on a Single TPU v5e Chip | v5e ×1, Gemma 2B |
 | 4 | [10.5281/zenodo.21404155](https://doi.org/10.5281/zenodo.21404155) | The Decode Block Size Heuristic in TPU Ragged Paged Attention | v6e-4 (TP=4), Gemma 2 27B / Gemma 4 31B |
 | 5 | [10.5281/zenodo.21462837](https://doi.org/10.5281/zenodo.21462837) | Batch Scaling and Goodput of a Tuned Attention Kernel on TPU v6e | v6e-4 (TP=4), Gemma 4 31B |

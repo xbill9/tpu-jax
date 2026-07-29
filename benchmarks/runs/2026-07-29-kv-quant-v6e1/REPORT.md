@@ -8,22 +8,33 @@
 The v6e-1 has **two independent memory budgets**, and almost every optimization
 this repo tried was aimed at the wrong one.
 
-| budget | governs | measured |
+| budget | governs | measured (donated, see below) |
 |---|---|---|
-| resident KV tokens | decode / concurrency | **663,552-712,704** bf16 · **1,245,184-1,540,096** int8 |
+| resident KV tokens | decode / concurrency | **1,245,184-1,425,408** bf16 · **2,260,992-2,818,048** int8 |
 | prompt tokens per prefill pass | batch admission | **B x chunk <= 8,192** |
 
 Neither is a batch size.
 
-> **Corrected 2026-07-29 (later session).** An earlier version of this report gave
-> the decode budget as a flat 524,288 tokens with "0.0% spread across four context
-> lengths", and int8 KV as "exactly 2.00x". Both were artifacts of the measurement
-> grid: every ladder was built from the same power-of-two skeleton, so the last
-> passing rung landed on a common product by construction. Re-measured by bisection
-> to 2%, the ceiling is 663,552-712,704 and varies ~7% with context, and int8 KV
-> gives 1.88-1.98x. The conclusions are unchanged; the precision was manufactured.
-> Lesson retained in the methods section: a result that lands exactly on a round
-> number should be suspected of coming from the sampling grid.
+> **These numbers were revised twice. Read this before quoting any of them.**
+>
+> | revision | ctx 8192, bf16 | why the previous one was wrong |
+> |---|---:|---|
+> | 1st, doubling ladder | 524,288 | every ladder shared a power-of-two skeleton, so the last passing rung landed on a common product by construction — manufacturing a "flat, 0.0% spread across four contexts" invariant that does not exist |
+> | 2nd, bisected to 2% | 712,704 | measured on the copying path: without buffer donation two full-size KV caches are live at once, halving the ceiling |
+> | **3rd, bisected + donated** | **1,425,408** | — |
+>
+> Each revision fixed a defect in the *method*, not the hardware, and each time the
+> superseded number looked solid: the bisection was reproducible to the token across
+> two sessions and two VMs, and was still half the truth.
+>
+> The third revision carries a check the first two lacked. It predicts that one
+> 2-byte cache should occupy the same HBM as two 1-byte caches — and
+> `bf16/donated` equals `int8/copying` at 1,245,184 tokens **exactly** at ctx 512.
+> That is a falsifiable prediction the model was not fitted to, and it held.
+>
+> Sections 1-3 below quote the 2nd-revision (copying-path) figures where they were
+> measured that way. They are internally consistent and the *ratios* in them hold;
+> the absolute ceilings are ~2x low. Addendum 5 has the corrected values.
 
 ## 1. The decode budget is a constant, to 0.0%
 
@@ -587,3 +598,61 @@ between configurations were right; the baseline they were measured against was
 wrong. Cross-checking against an absolute physical bound — bytes moved per second
 against calibrated bandwidth — is what exposed it, and no amount of A/B rigor
 would have.
+
+---
+
+# Addendum 5: donation also doubles CAPACITY
+
+Every ceiling in sections 1-3 was measured on the copying path, where the step
+allocates a new KV cache while the old one is still live. Two full-size caches
+resident at once halves the ceiling. Re-bisected with donation as the only
+variable, one configuration per process:
+
+| cache | ctx | copying | donated | gain |
+|---|---:|---:|---:|:---:|
+| bf16 | 512 | 663,552 | **1,245,184** | 1.877x |
+| bf16 | 8192 | 712,704 | **1,425,408** | **2.000x** |
+| int8 | 512 | 1,245,184 | **2,260,992** | 1.816x |
+| int8 | 8192 | 1,409,024 | **2,818,048** | **2.000x** |
+
+Exactly 2.000x at ctx 8192 for both dtypes — the signature of removing a
+duplicate buffer rather than of anything subtler.
+
+**The two effects are independent and multiply.** int8's capacity advantage
+survives donation (1.82-1.98x), because halving bytes/token is a property of the
+data and donation is a property of the schedule:
+
+| | copying | donated |
+|---|---:|---:|
+| int8 / bf16 at ctx 512 | 1.877x | 1.816x |
+| int8 / bf16 at ctx 8192 | 1.977x | 1.977x |
+
+Combined against the original baseline: **712,704 -> 2,818,048 resident KV
+tokens = 3.95x**, or **B=87 -> B=344 concurrent sequences at 8K context** on one
+chip.
+
+## The check that makes this revision more trustworthy than the last two
+
+The model says the copying path holds two caches. If so, one 2-byte cache should
+occupy the same HBM as two 1-byte caches, and `bf16/donated` should equal
+`int8/copying`:
+
+| ctx | bf16 donated | int8 copying | ratio |
+|---:|---:|---:|---:|
+| 512 | 1,245,184 | 1,245,184 | **1.0000** |
+| 8192 | 1,425,408 | 1,409,024 | 1.0116 |
+
+Exact at ctx 512, within 1.2% at 8192. That is a prediction the model was not
+fitted to, and the first falsifiable one these capacity figures have carried.
+
+The copying-path rows also reproduced the earlier bisection to the token
+(1296 -> 663,552 and 87 -> 712,704) on a fresh VM in a fresh process, which
+independently replicates half the dataset.
+
+## Caveat on absolute step times in this table
+
+Timings here are higher than in addendum 4 because donation invalidates its input
+buffers, so a donated step cannot be replayed on the same arrays — the harness
+reallocates the cache inside the timed region for **both** paths to keep the
+comparison fair. That charges every sample an allocation the addendum-4 harness
+avoided. Use addendum 4 for step latency and this table for ceilings.
