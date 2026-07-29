@@ -1,6 +1,0 @@
-Successfully renamed PrivateUse1 backend to 'tpu'. Device: device(type='tpu')
-Registered Python module for 'tpu'.
-Device type: tpu, Device index: default
-Initializing TPU distributed runtime
-MARKER shift variant rel diff: 3.128e-03
-MARKER bitcast FAILED: Changing bitwidths not supported.

@@ -33,7 +33,7 @@ def build_benchmark_params(config: Gemma4EConfig):
         "embed_tokens": jax.random.normal(key, (config.vocab_size, config.hidden_size), dtype=jnp.bfloat16) * 0.02,
         "embed_tokens_per_layer": jax.random.normal(key, (config.vocab_size_per_layer_input, config.num_hidden_layers * config.hidden_size_per_layer_input), dtype=jnp.bfloat16) * 0.02,
         "per_layer_model_projection": jax.random.normal(key, (config.hidden_size, config.num_hidden_layers * config.hidden_size_per_layer_input), dtype=jnp.bfloat16) * 0.02,
-        "per_layer_projection_norm": jnp.ones((config.num_hidden_layers * config.hidden_size_per_layer_input,), dtype=jnp.bfloat16),
+        "per_layer_projection_norm": jnp.ones((config.hidden_size_per_layer_input,), dtype=jnp.bfloat16),
         "final_norm": jnp.ones((config.hidden_size,), dtype=jnp.bfloat16),
     }
 

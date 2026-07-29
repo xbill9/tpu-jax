@@ -1,30 +1,0 @@
-Successfully renamed PrivateUse1 backend to 'tpu'. Device: device(type='tpu')
-Registered Python module for 'tpu'.
-Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
-WARNING:huggingface_hub.utils._http:Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
-[transformers] `torch_dtype` is deprecated! Use `dtype` instead!
-Device type: tpu, Device index: default
-Initializing TPU distributed runtime
-Loading google/gemma-4-E2B-it-qat-w4a16-ct packed (run_compressed=True, CPU)...
-Compressing model:   0%|          | 0/276 [00:00<?, ?it/s]Compressing model:  27%|██▋       | 75/276 [00:00<00:00, 749.44it/s]Compressing model:  55%|█████▌    | 152/276 [00:00<00:00, 757.01it/s]Compressing model:  83%|████████▎ | 229/276 [00:00<00:00, 759.62it/s]Compressing model: 100%|██████████| 276/276 [00:00<00:00, 759.19it/s]
-Loading weights:   0%|          | 0/2504 [00:00<?, ?it/s]Loading weights:  46%|████▌     | 1150/2504 [00:00<00:00, 11491.24it/s]Loading weights:  92%|█████████▏| 2300/2504 [00:00<00:00, 11197.59it/s]Loading weights: 100%|██████████| 2504/2504 [00:00<00:00, 11262.74it/s]
-MARKER swapped: 276 fused, 0 fallback (in-graph)
-Warmup (4 steps, includes compile)...
-Decompressing model: 0it [00:00, ?it/s]Decompressing model: 0it [00:00, ?it/s]
-/usr/local/lib/python3.12/dist-packages/torch/_dynamo/utils.py:3895: UserWarning: TorchTPU only supports FLASH_ATTENTION SDPBackend for scaled_dot_product_attention when these conditions are met:
-- attn_mask is None (current: present)
-- dropout_p is 0.0 (current: 0)
-- inputs are float32 or bfloat16 (current: BFloat16)
-- inputs have the same rank (query: 4, key: 4, value: 4)
-- query rank is at least 4 (current: 4)
-- batch size is at least 1 (current: 1)
-- Sequence lengths (dim - 2) are divisible by 512 (query: 256, key: 256, value: 256)
-- Head dimension (dim - 1) is less than 128 or divisible by 128 (query: 256) (Triggered internally at torch_tpu/ops/scaled_dot_product_attention/scaled_dot_product_attention_aten_kernels.cc:400.)
-  return node.target(*args, **kwargs)  # type: ignore[operator]
-/usr/local/lib/python3.12/dist-packages/torch/_inductor/codecache.py:1074: FutureWarning: `isinstance(treespec, LeafSpec)` is deprecated, use `isinstance(treespec, TreeSpec) and treespec.is_leaf()` instead.
-  yield pickle.loads(content), content, True
-MARKER warmup done in 51.9s
---- output -------------------------------------------------
-TPUs are fast because they are specifically designed for the massive parallel computations required by machine learning, utilizing specialized hardware optimized for matrix multiplications. This architecture allows them to process vast amounts of data simultaneously, leading to significantly faster training and inference times compared to traditional CPUs.
-------------------------------------------------------------
-MARKER FUSED w4a16 compiled decode (SEQ=256, no KV cache): 64 steps in 0.57s = 112.9 tok/s (8.9 ms/step)

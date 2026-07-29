@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """OpenAI-Compatible FastAPI Server for pure JAX Gemma 4 on TPU v6e-1.
 
+Generation runs entirely on the pure-JAX engine in ``jax_engine.py`` (no
+PyTorch, no torch_xla) against a static KV cache, so every streamed token
+attends to the full history.
+
 Configured with:
 - Model: google/gemma-4-E2B-it-qat-w4a16-ct (W4A16 QAT)
-- Precision: W4 Weights, BF16 Activations, FP8/BF16 KV Cache
+- Precision: W4 weights, BF16 activations, BF16/FP8 KV cache
 - Endpoints:
   - GET  /health
   - GET  /metrics  (Prometheus format metrics)
@@ -13,40 +17,34 @@ Configured with:
 """
 
 import argparse
-import time
+import json
 import os
-import sys
-from typing import List, Optional, Union
-from pydantic import BaseModel, Field
+import time
 
 import jax
-import jax.numpy as jnp
+from pydantic import BaseModel
 
 # Enable native TPU MXU bfloat16 matmul precision
 jax.config.update("jax_default_matmul_precision", "bfloat16")
 
-# Enable persistent JAX XLA Compilation Disk Cache (skips ~17s compile overhead on restarts)
+# Persistent XLA compilation disk cache (skips ~17s of compilation on restarts)
 _cache_dir = os.path.expanduser("~/.cache/jax_compilation_cache")
 os.makedirs(_cache_dir, exist_ok=True)
 jax.config.update("jax_compilation_cache_dir", _cache_dir)
 jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
-import json
-from threading import Thread
-import transformers
-import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
+
+import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import PlainTextResponse, StreamingResponse
-import uvicorn
 
-# Global state for JAX model & tokenizer
-MODEL = None
+from jax_engine import GenerationStats, JaxGemmaEngine
+
+# Global state
+ENGINE: JaxGemmaEngine | None = None
 TOKENIZER = None
-DEVICE = None
 MODEL_ID = "google/gemma-4-E2B-it-qat-w4a16-ct"
-KV_CACHE_DTYPE = "fp8"
+KV_CACHE_DTYPE = "bf16"
 
-# Metrics counters
 METRICS = {
     "total_requests": 0,
     "successful_requests": 0,
@@ -55,40 +53,61 @@ METRICS = {
     "completion_tokens_total": 0,
     "total_latency_seconds": 0.0,
     "last_tokens_per_second": 0.0,
+    "last_prefill_ms": 0.0,
 }
 
 app = FastAPI(title="Pure JAX Gemma 4 W4A16 QAT Server on TPU v6e-1")
+
 
 class ChatMessage(BaseModel):
     role: str
     content: str
 
+
 class ChatCompletionRequest(BaseModel):
-    model: Optional[str] = MODEL_ID
-    messages: List[ChatMessage]
-    max_tokens: Optional[int] = 128
-    temperature: Optional[float] = 0.7
-    stream: Optional[bool] = False
+    model: str | None = None
+    messages: list[ChatMessage]
+    max_tokens: int | None = 128
+    temperature: float | None = 0.7
+    top_k: int | None = 40
+    stream: bool | None = False
+
 
 class CompletionRequest(BaseModel):
-    model: Optional[str] = MODEL_ID
-    prompt: Union[str, List[str]]
-    max_tokens: Optional[int] = 128
-    stream: Optional[bool] = False
+    model: str | None = None
+    prompt: str | list[str]
+    max_tokens: int | None = 128
+    temperature: float | None = 0.0
+    top_k: int | None = 40
+    stream: bool | None = False
+
 
 def fetch_hf_token():
     if os.environ.get("HF_TOKEN"):
         return os.environ["HF_TOKEN"]
     try:
-        import urllib.request, json, base64
-        req = urllib.request.Request("http://metadata.google.internal/computeMetadata/v1/project/project-id", headers={"Metadata-Flavor": "Google"})
+        import base64
+        import urllib.request
+
+        req = urllib.request.Request(
+            "http://metadata.google.internal/computeMetadata/v1/project/project-id",
+            headers={"Metadata-Flavor": "Google"},
+        )
         with urllib.request.urlopen(req, timeout=5) as res:
             project = res.read().decode()
-        token_req = urllib.request.Request("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token", headers={"Metadata-Flavor": "Google"})
+        token_req = urllib.request.Request(
+            "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token",
+            headers={"Metadata-Flavor": "Google"},
+        )
         with urllib.request.urlopen(token_req, timeout=5) as res:
             access_token = json.loads(res.read().decode())["access_token"]
-        secret_url = f"https://secretmanager.googleapis.com/v1/projects/{project}/secrets/hf-token/versions/latest:access"
-        sec_req = urllib.request.Request(secret_url, headers={"Authorization": f"Bearer {access_token}"})
+        secret_url = (
+            f"https://secretmanager.googleapis.com/v1/projects/{project}"
+            "/secrets/hf-token/versions/latest:access"
+        )
+        sec_req = urllib.request.Request(
+            secret_url, headers={"Authorization": f"Bearer {access_token}"}
+        )
         with urllib.request.urlopen(sec_req, timeout=5) as res:
             data = json.load(res)["payload"]["data"]
             token = base64.b64decode(data).decode()
@@ -98,56 +117,133 @@ def fetch_hf_token():
     except Exception:
         return None
 
-def load_jax_gemma(model_id: str, kv_dtype: str = "fp8"):
-    global MODEL, TOKENIZER, DEVICE, MODEL_ID, KV_CACHE_DTYPE
-    MODEL_ID = model_id
-    KV_CACHE_DTYPE = kv_dtype
+
+def load_engine(
+    model_id: str,
+    kv_dtype: str = "bf16",
+    quant_mode: str = "w4a16",
+    max_model_len: int = 4096,
+    local_dir: str | None = None,
+):
+    global ENGINE, TOKENIZER, MODEL_ID, KV_CACHE_DTYPE
+    MODEL_ID, KV_CACHE_DTYPE = model_id, kv_dtype
     fetch_hf_token()
 
-    devices = jax.devices()
-    print(f"JAX Devices: {devices}")
-    DEVICE = devices[0]
+    print(f"JAX devices: {jax.devices()}")
 
-    print(f"Loading Tokenizer: {model_id}")
+    from transformers import AutoTokenizer
+
+    print(f"Loading tokenizer: {model_id}")
     TOKENIZER = AutoTokenizer.from_pretrained(model_id)
 
-    print(f"Loading W4A16 QAT Model Weights into JAX on TPU v6e-1: {model_id}")
-    pt_model = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        torch_dtype=torch.bfloat16,
-        trust_remote_code=True
+    print(f"Loading W4A16 QAT weights into JAX: {model_id}")
+    t0 = time.perf_counter()
+    engine = JaxGemmaEngine(
+        model_id=model_id,
+        kv_cache_dtype=kv_dtype,
+        quant_mode=quant_mode,
+        max_model_len=max_model_len,
+    )
+    engine.load(local_dir=local_dir)
+    engine.bos_token_id = getattr(TOKENIZER, "bos_token_id", None)
+    ENGINE = engine
+    load_s = time.perf_counter() - t0
+    print(
+        f"Loaded {engine.weight_bytes / 1e9:.2f} GB of parameters on {engine.device} "
+        f"in {load_s:.1f}s (KV cache: {kv_dtype})"
     )
 
-    # Convert parameter tensors to JAX bfloat16 arrays placed on TPU
-    jax_params = {}
-    for name, param in pt_model.state_dict().items():
-        if param.dtype == torch.bfloat16:
-            np_arr = param.detach().to(torch.float32).cpu().numpy()
-            jax_params[name] = jax.device_put(jnp.array(np_arr, dtype=jnp.bfloat16), DEVICE)
-        else:
-            np_arr = param.detach().cpu().numpy()
-            jax_params[name] = jax.device_put(jnp.array(np_arr), DEVICE)
 
-    MODEL = pt_model
-    print(f"✅ Loaded {len(jax_params)} JAX parameter tensors on TPU {DEVICE} (KV Cache: {KV_CACHE_DTYPE.upper()})")
+def _eos_ids() -> list[int]:
+    ids = []
+    for attr in ("eos_token_id", "pad_token_id"):
+        val = getattr(TOKENIZER, attr, None)
+        if isinstance(val, int):
+            ids.append(val)
+        elif isinstance(val, list):
+            ids.extend(v for v in val if isinstance(v, int))
+    # Gemma chat turns terminate on <end_of_turn>
+    try:
+        turn_end = TOKENIZER.convert_tokens_to_ids("<end_of_turn>")
+        if isinstance(turn_end, int) and turn_end >= 0:
+            ids.append(turn_end)
+    except Exception:
+        pass
+    return sorted(set(ids))
+
+
+def _require_ready():
+    if ENGINE is None or not ENGINE.is_ready or TOKENIZER is None:
+        raise HTTPException(status_code=503, detail="JAX engine is loading")
+
+
+def _record(stats: GenerationStats, elapsed: float):
+    METRICS["successful_requests"] += 1
+    METRICS["prompt_tokens_total"] += stats.prompt_tokens
+    METRICS["completion_tokens_total"] += stats.completion_tokens
+    METRICS["total_latency_seconds"] += elapsed
+    METRICS["last_tokens_per_second"] = stats.decode_tok_per_s
+    METRICS["last_prefill_ms"] = stats.prefill_ms
+
+
+def _sse_stream(prompt_ids, req, req_id: str, object_name: str, t0: float):
+    """Shared SSE generator for chat and text completions."""
+    created = int(time.time())
+
+    def emit(delta_field: dict, finish=None):
+        chunk = {
+            "id": req_id,
+            "object": object_name,
+            "created": created,
+            "model": req.model or MODEL_ID,
+            "choices": [{"index": 0, **delta_field, "finish_reason": finish}],
+        }
+        return f"data: {json.dumps(chunk)}\n\n"
+
+    is_chat = object_name == "chat.completion.chunk"
+    stats: GenerationStats | None = None
+    for item in ENGINE.generate_stream(
+        prompt_ids,
+        max_new_tokens=req.max_tokens or 128,
+        temperature=req.temperature if req.temperature is not None else 0.0,
+        top_k=req.top_k or 40,
+        eos_token_ids=_eos_ids(),
+    ):
+        if isinstance(item, GenerationStats):
+            stats = item
+            break
+        text = TOKENIZER.decode([item], skip_special_tokens=True)
+        yield emit({"delta": {"content": text}} if is_chat else {"text": text})
+
+    if stats is not None:
+        _record(stats, time.time() - t0)
+        finish = stats.finish_reason
+    else:
+        finish = "stop"
+    yield emit({"delta": {}} if is_chat else {"text": ""}, finish=finish)
+    yield "data: [DONE]\n\n"
+
 
 @app.get("/health")
 def health():
+    ready = ENGINE is not None and ENGINE.is_ready
     return {
-        "status": "ok",
+        "status": "ok" if ready else "loading",
         "backend": "jax",
-        "device": str(DEVICE),
+        "device": str(ENGINE.device) if ready else None,
         "model": MODEL_ID,
-        "precision": {"weights": "w4_int4", "activations": "bfloat16", "kv_cache": KV_CACHE_DTYPE}
+        "precision": {
+            "weights": "w4_int4" if ready and ENGINE.quant_mode == "w4a16" else "bf16",
+            "activations": "bfloat16",
+            "kv_cache": KV_CACHE_DTYPE,
+        },
     }
+
 
 @app.get("/metrics", response_class=PlainTextResponse)
 def metrics():
-    # Gather TPU HBM stats via JAX
-    mem_stats = DEVICE.memory_stats() if hasattr(DEVICE, "memory_stats") else {}
-    bytes_in_use = mem_stats.get("bytes_in_use", 0)
-    bytes_limit = mem_stats.get("bytes_limit", 33546042880)
-
+    mem = ENGINE.memory_stats() if (ENGINE and ENGINE.is_ready) else {}
+    device = str(ENGINE.device) if (ENGINE and ENGINE.is_ready) else "unknown"
     lines = [
         "# HELP tpu_jax_requests_total Total HTTP requests processed by JAX TPU server",
         "# TYPE tpu_jax_requests_total counter",
@@ -166,229 +262,161 @@ def metrics():
         "# TYPE tpu_jax_latency_seconds_sum counter",
         f'tpu_jax_latency_seconds_sum{{model="{MODEL_ID}"}} {METRICS["total_latency_seconds"]:.3f}',
         "",
-        "# HELP tpu_jax_tokens_per_second Current generation throughput in tokens per second",
-        "# TYPE tpu_jax_tokens_per_second gauge",
-        f'tpu_jax_tokens_per_second{{model="{MODEL_ID}"}} {METRICS["last_tokens_per_second"]:.1f}',
+        "# HELP tpu_jax_decode_tokens_per_second Decode throughput of the last request",
+        "# TYPE tpu_jax_decode_tokens_per_second gauge",
+        f'tpu_jax_decode_tokens_per_second{{model="{MODEL_ID}"}} {METRICS["last_tokens_per_second"]:.1f}',
+        "",
+        "# HELP tpu_jax_prefill_milliseconds Prefill (TTFT) of the last request",
+        "# TYPE tpu_jax_prefill_milliseconds gauge",
+        f'tpu_jax_prefill_milliseconds{{model="{MODEL_ID}"}} {METRICS["last_prefill_ms"]:.1f}',
+        "",
+        "# HELP tpu_jax_weight_bytes Parameter footprint resident on device",
+        "# TYPE tpu_jax_weight_bytes gauge",
+        f'tpu_jax_weight_bytes{{model="{MODEL_ID}"}} {mem.get("weight_bytes", 0)}',
         "",
         "# HELP tpu_jax_hbm_used_bytes High Bandwidth Memory used in bytes",
         "# TYPE tpu_jax_hbm_used_bytes gauge",
-        f'tpu_jax_hbm_used_bytes{{device="{DEVICE}"}} {bytes_in_use}',
+        f'tpu_jax_hbm_used_bytes{{device="{device}"}} {mem.get("hbm_bytes_in_use", 0)}',
         "",
         "# HELP tpu_jax_hbm_limit_bytes High Bandwidth Memory total limit in bytes",
         "# TYPE tpu_jax_hbm_limit_bytes gauge",
-        f'tpu_jax_hbm_limit_bytes{{device="{DEVICE}"}} {bytes_limit}',
-        ""
+        f'tpu_jax_hbm_limit_bytes{{device="{device}"}} {mem.get("hbm_bytes_limit", 0)}',
+        "",
     ]
     return "\n".join(lines)
+
 
 @app.get("/v1/models")
 def list_models():
     return {
         "object": "list",
         "data": [
-            {
-                "id": MODEL_ID,
-                "object": "model",
-                "created": int(time.time()),
-                "owned_by": "jax-tpu"
-            }
-        ]
+            {"id": MODEL_ID, "object": "model", "created": int(time.time()), "owned_by": "jax-tpu"}
+        ],
     }
+
+
+def _chat_prompt_ids(messages) -> list[int]:
+    formatted = [{"role": m.role, "content": m.content} for m in messages]
+    if hasattr(TOKENIZER, "apply_chat_template"):
+        return TOKENIZER.apply_chat_template(formatted, tokenize=True, add_generation_prompt=True)
+    text = "\n".join(f"{m.role}: {m.content}" for m in messages)
+    return TOKENIZER(text)["input_ids"]
+
 
 @app.post("/v1/chat/completions")
 def chat_completions(req: ChatCompletionRequest):
-    if MODEL is None or TOKENIZER is None:
-        raise HTTPException(status_code=503, detail="JAX model is loading")
-
+    _require_ready()
     METRICS["total_requests"] += 1
     t0 = time.time()
+    req_id = f"chatcmpl-jax-{int(t0 * 1000)}"
     try:
-        formatted_messages = [{"role": m.role, "content": m.content} for m in req.messages]
-        if hasattr(TOKENIZER, "apply_chat_template"):
-            prompt_text = TOKENIZER.apply_chat_template(formatted_messages, tokenize=False, add_generation_prompt=True)
-        else:
-            prompt_text = "\n".join([f"{m.role}: {m.content}" for m in req.messages])
-
-        inputs = TOKENIZER(prompt_text, return_tensors="pt")
-        prompt_tokens = inputs["input_ids"].shape[1]
+        prompt_ids = _chat_prompt_ids(req.messages)
 
         if req.stream:
-            streamer = TextIteratorStreamer(TOKENIZER, skip_prompt=True, skip_special_tokens=True)
-            gen_kwargs = dict(inputs, streamer=streamer, max_new_tokens=req.max_tokens or 128, do_sample=False)
-            thread = Thread(target=MODEL.generate, kwargs=gen_kwargs)
-            thread.start()
+            return StreamingResponse(
+                _sse_stream(prompt_ids, req, req_id, "chat.completion.chunk", t0),
+                media_type="text/event-stream",
+            )
 
-            def chat_sse_generator():
-                req_id = f"chatcmpl-jax-{int(time.time() * 1000)}"
-                created = int(time.time())
-                total_gen_tokens = 0
-                for token_text in streamer:
-                    total_gen_tokens += 1
-                    chunk = {
-                        "id": req_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": req.model or MODEL_ID,
-                        "choices": [{"index": 0, "delta": {"content": token_text}, "finish_reason": None}]
-                    }
-                    yield f"data: {json.dumps(chunk)}\n\n"
-                
-                elapsed = time.time() - t0
-                tok_per_sec = total_gen_tokens / max(elapsed, 0.001)
-                METRICS["successful_requests"] += 1
-                METRICS["prompt_tokens_total"] += prompt_tokens
-                METRICS["completion_tokens_total"] += total_gen_tokens
-                METRICS["total_latency_seconds"] += elapsed
-                METRICS["last_tokens_per_second"] = tok_per_sec
-
-                final_chunk = {
-                    "id": req_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": req.model or MODEL_ID,
-                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
-                }
-                yield f"data: {json.dumps(final_chunk)}\n\n"
-                yield "data: [DONE]\n\n"
-
-            return StreamingResponse(chat_sse_generator(), media_type="text/event-stream")
-
-        # Non-streaming response
-        with torch.no_grad():
-            output_ids = MODEL.generate(**inputs, max_new_tokens=req.max_tokens or 128, do_sample=False)
-
-        gen_tokens = output_ids.shape[1] - prompt_tokens
-        generated_text = TOKENIZER.decode(output_ids[0][prompt_tokens:], skip_special_tokens=True)
+        tokens, stats = ENGINE.generate(
+            prompt_ids,
+            max_new_tokens=req.max_tokens or 128,
+            temperature=req.temperature if req.temperature is not None else 0.0,
+            top_k=req.top_k or 40,
+            eos_token_ids=_eos_ids(),
+        )
         elapsed = time.time() - t0
-
-        tok_per_sec = gen_tokens / max(elapsed, 0.001)
-        METRICS["successful_requests"] += 1
-        METRICS["prompt_tokens_total"] += prompt_tokens
-        METRICS["completion_tokens_total"] += gen_tokens
-        METRICS["total_latency_seconds"] += elapsed
-        METRICS["last_tokens_per_second"] = tok_per_sec
+        _record(stats, elapsed)
+        text = TOKENIZER.decode(tokens, skip_special_tokens=True)
 
         return {
-            "id": f"chatcmpl-jax-{int(time.time() * 1000)}",
+            "id": req_id,
             "object": "chat.completion",
-            "created": int(time.time()),
+            "created": int(t0),
             "model": req.model or MODEL_ID,
             "choices": [
                 {
                     "index": 0,
-                    "message": {"role": "assistant", "content": generated_text.strip()},
-                    "finish_reason": "stop"
+                    "message": {"role": "assistant", "content": text.strip()},
+                    "finish_reason": stats.finish_reason,
                 }
             ],
             "usage": {
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": gen_tokens,
-                "total_tokens": prompt_tokens + gen_tokens,
+                "prompt_tokens": stats.prompt_tokens,
+                "completion_tokens": stats.completion_tokens,
+                "total_tokens": stats.prompt_tokens + stats.completion_tokens,
                 "latency_seconds": round(elapsed, 3),
-                "tokens_per_second": round(tok_per_sec, 1)
-            }
+                "prefill_ms": round(stats.prefill_ms, 1),
+                "decode_tokens_per_second": round(stats.decode_tok_per_s, 1),
+            },
         }
-    except Exception as e:
+    except HTTPException:
+        raise
+    except Exception as exc:
         METRICS["failed_requests"] += 1
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(exc))
+
 
 @app.post("/v1/completions")
 def text_completions(req: CompletionRequest):
-    if MODEL is None or TOKENIZER is None:
-        raise HTTPException(status_code=503, detail="JAX model is loading")
-
+    _require_ready()
     METRICS["total_requests"] += 1
     t0 = time.time()
+    req_id = f"cmpl-jax-{int(t0 * 1000)}"
     try:
         prompt_text = req.prompt if isinstance(req.prompt, str) else req.prompt[0]
-        inputs = TOKENIZER(prompt_text, return_tensors="pt")
-        prompt_tokens = inputs["input_ids"].shape[1]
+        prompt_ids = TOKENIZER(prompt_text)["input_ids"]
 
         if req.stream:
-            streamer = TextIteratorStreamer(TOKENIZER, skip_prompt=True, skip_special_tokens=True)
-            gen_kwargs = dict(inputs, streamer=streamer, max_new_tokens=req.max_tokens or 128, do_sample=False)
-            thread = Thread(target=MODEL.generate, kwargs=gen_kwargs)
-            thread.start()
+            return StreamingResponse(
+                _sse_stream(prompt_ids, req, req_id, "text_completion", t0),
+                media_type="text/event-stream",
+            )
 
-            def text_sse_generator():
-                req_id = f"cmpl-jax-{int(time.time() * 1000)}"
-                created = int(time.time())
-                total_gen_tokens = 0
-                for token_text in streamer:
-                    total_gen_tokens += 1
-                    chunk = {
-                        "id": req_id,
-                        "object": "text_completion",
-                        "created": created,
-                        "model": req.model or MODEL_ID,
-                        "choices": [{"text": token_text, "index": 0, "finish_reason": None}]
-                    }
-                    yield f"data: {json.dumps(chunk)}\n\n"
-
-                elapsed = time.time() - t0
-                tok_per_sec = total_gen_tokens / max(elapsed, 0.001)
-                METRICS["successful_requests"] += 1
-                METRICS["prompt_tokens_total"] += prompt_tokens
-                METRICS["completion_tokens_total"] += total_gen_tokens
-                METRICS["total_latency_seconds"] += elapsed
-                METRICS["last_tokens_per_second"] = tok_per_sec
-
-                final_chunk = {
-                    "id": req_id,
-                    "object": "text_completion",
-                    "created": created,
-                    "model": req.model or MODEL_ID,
-                    "choices": [{"text": "", "index": 0, "finish_reason": "stop"}]
-                }
-                yield f"data: {json.dumps(final_chunk)}\n\n"
-                yield "data: [DONE]\n\n"
-
-            return StreamingResponse(text_sse_generator(), media_type="text/event-stream")
-
-        # Non-streaming response
-        with torch.no_grad():
-            output_ids = MODEL.generate(**inputs, max_new_tokens=req.max_tokens or 128, do_sample=False)
-
-        gen_tokens = output_ids.shape[1] - prompt_tokens
-        generated_text = TOKENIZER.decode(output_ids[0][prompt_tokens:], skip_special_tokens=True)
+        tokens, stats = ENGINE.generate(
+            prompt_ids,
+            max_new_tokens=req.max_tokens or 128,
+            temperature=req.temperature if req.temperature is not None else 0.0,
+            top_k=req.top_k or 40,
+            eos_token_ids=_eos_ids(),
+        )
         elapsed = time.time() - t0
-
-        tok_per_sec = gen_tokens / max(elapsed, 0.001)
-        METRICS["successful_requests"] += 1
-        METRICS["prompt_tokens_total"] += prompt_tokens
-        METRICS["completion_tokens_total"] += gen_tokens
-        METRICS["total_latency_seconds"] += elapsed
-        METRICS["last_tokens_per_second"] = tok_per_sec
+        _record(stats, elapsed)
+        text = TOKENIZER.decode(tokens, skip_special_tokens=True)
 
         return {
-            "id": f"cmpl-jax-{int(time.time() * 1000)}",
+            "id": req_id,
             "object": "text_completion",
-            "created": int(time.time()),
+            "created": int(t0),
             "model": req.model or MODEL_ID,
-            "choices": [
-                {
-                    "text": generated_text.strip(),
-                    "index": 0,
-                    "finish_reason": "stop"
-                }
-            ],
+            "choices": [{"text": text.strip(), "index": 0, "finish_reason": stats.finish_reason}],
             "usage": {
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": gen_tokens,
-                "total_tokens": prompt_tokens + gen_tokens
-            }
+                "prompt_tokens": stats.prompt_tokens,
+                "completion_tokens": stats.completion_tokens,
+                "total_tokens": stats.prompt_tokens + stats.completion_tokens,
+            },
         }
-    except Exception as e:
+    except HTTPException:
+        raise
+    except Exception as exc:
         METRICS["failed_requests"] += 1
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(exc))
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default=MODEL_ID)
     parser.add_argument("--kv-cache-dtype", default=KV_CACHE_DTYPE)
+    parser.add_argument("--quant-mode", default="w4a16", choices=["w4a16", "fp16"])
+    parser.add_argument("--max-model-len", type=int, default=4096)
+    parser.add_argument("--local-dir", default=None,
+                        help="Load from a local checkpoint dir instead of the Hub")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
     args = parser.parse_args()
 
-    load_jax_gemma(args.model, args.kv_cache_dtype)
+    load_engine(
+        args.model, args.kv_cache_dtype, args.quant_mode, args.max_model_len, args.local_dir
+    )
     uvicorn.run(app, host=args.host, port=args.port)

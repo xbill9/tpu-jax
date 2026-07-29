@@ -1,58 +1,0 @@
-WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
-I0000 00:00:1785017358.726370   20169 pjrt_api.cc:119] GetPjrtApi was found for TPU at /usr/local/lib/python3.12/dist-packages/libtpu/libtpu.so
-I0000 00:00:1785017358.741151   20169 tpu_profiler_plugin.cc:712] PyTorch PrivateUse1ProfilerRegistry not found. Native TPU profiling will be disabled (this is expected on PyTorch < 2.12).
-I0000 00:00:1785017359.535648   20169 device_rt.cc:125] PjRt runtime initialization deferred for tpu
-Successfully renamed PrivateUse1 backend to 'tpu'. Device: device(type='tpu')
-Registered Python module for 'tpu'.
-Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
-[transformers] `torch_dtype` is deprecated! Use `dtype` instead!
-/usr/local/lib/python3.12/dist-packages/transformers/quantizers/auto.py:271: UserWarning: You passed `quantization_config` or equivalent parameters to `from_pretrained` but the model you're loading already has a `quantization_config` attribute. The `quantization_config` from the model will be used.However, loading attributes (e.g. ['run_compressed']) will be overwritten with the one you passed to `from_pretrained`. The rest will be ignored.
-  warnings.warn(warning_msg)
-Device type: tpu, Device index: default
-Initializing TPU distributed runtime
-Phase 1: reference dequantized load (run_compressed=False, CPU)...
-Compressing model:   0%|          | 0/343 [00:00<?, ?it/s]Compressing model:  22%|██▏       | 76/343 [00:00<00:00, 753.27it/s]Compressing model:  45%|████▍     | 153/343 [00:00<00:00, 758.45it/s]Compressing model:  67%|██████▋   | 229/343 [00:00<00:00, 756.71it/s]Compressing model:  89%|████████▉ | 305/343 [00:00<00:00, 756.88it/s]Compressing model: 100%|██████████| 343/343 [00:00<00:00, 757.37it/s]
-Loading weights:   0%|          | 0/2763 [00:00<?, ?it/s]Loading weights:  41%|████      | 1135/2763 [00:00<00:00, 11338.71it/s]Loading weights:  82%|████████▏ | 2269/2763 [00:00<00:00, 10769.67it/s]Loading weights: 100%|██████████| 2763/2763 [00:00<00:00, 10942.04it/s]
-Decompressing model:   0%|          | 0/343 [00:00<?, ?it/s]Decompressing model:   4%|▍         | 14/343 [00:00<00:02, 118.80it/s]Decompressing model:   8%|▊         | 26/343 [00:00<00:02, 107.90it/s]Decompressing model:  12%|█▏        | 41/343 [00:00<00:02, 117.01it/s]Decompressing model:  15%|█▌        | 53/343 [00:00<00:02, 106.11it/s]Decompressing model:  20%|█▉        | 68/343 [00:00<00:02, 115.87it/s]Decompressing model:  23%|██▎       | 80/343 [00:00<00:02, 108.47it/s]Decompressing model:  28%|██▊       | 95/343 [00:00<00:02, 116.80it/s]Decompressing model:  31%|███       | 107/343 [00:00<00:02, 106.36it/s]Decompressing model:  36%|███▌      | 122/343 [00:01<00:01, 112.79it/s]Decompressing model:  39%|███▉      | 134/343 [00:01<00:01, 105.83it/s]Decompressing model:  43%|████▎     | 149/343 [00:01<00:01, 113.85it/s]Decompressing model:  47%|████▋     | 161/343 [00:01<00:01, 99.87it/s] Decompressing model:  51%|█████▏    | 176/343 [00:01<00:01, 107.29it/s]Decompressing model:  55%|█████▍    | 188/343 [00:01<00:01, 103.30it/s]Decompressing model:  59%|█████▉    | 203/343 [00:01<00:01, 111.45it/s]Decompressing model:  63%|██████▎   | 215/343 [00:01<00:01, 104.77it/s]Decompressing model:  66%|██████▌   | 226/343 [00:02<00:01, 103.85it/s]Decompressing model:  69%|██████▉   | 237/343 [00:02<00:01, 99.11it/s] Decompressing model:  72%|███████▏  | 248/343 [00:02<00:01, 94.58it/s]Decompressing model:  75%|███████▌  | 258/343 [00:02<00:00, 93.48it/s]Decompressing model:  78%|███████▊  | 268/343 [00:02<00:00, 93.68it/s]Decompressing model:  81%|████████  | 278/343 [00:02<00:00, 90.60it/s]Decompressing model:  84%|████████▍ | 289/343 [00:02<00:00, 94.16it/s]Decompressing model:  87%|████████▋ | 299/343 [00:02<00:00, 88.71it/s]Decompressing model:  90%|█████████ | 310/343 [00:03<00:00, 92.65it/s]Decompressing model:  93%|█████████▎| 320/343 [00:03<00:00, 89.78it/s]Decompressing model:  97%|█████████▋| 331/343 [00:03<00:00, 94.18it/s]Decompressing model:  99%|█████████▉| 341/343 [00:03<00:00, 89.29it/s]Decompressing model: 100%|██████████| 343/343 [00:03<00:00, 100.91it/s]
-MARKER ref weight model.language_model.layers.0.mlp.gate_proj: (10240, 2560) torch.bfloat16
-Phase 2: packed load (run_compressed=True, CPU) + module swap...
-Compressing model:   0%|          | 0/343 [00:00<?, ?it/s]Compressing model:  22%|██▏       | 76/343 [00:00<00:00, 754.75it/s]Compressing model:  45%|████▍     | 153/343 [00:00<00:00, 758.73it/s]Compressing model:  67%|██████▋   | 229/343 [00:00<00:00, 758.62it/s]Compressing model:  89%|████████▉ | 306/343 [00:00<00:00, 759.31it/s]Compressing model: 100%|██████████| 343/343 [00:00<00:00, 758.77it/s]
-Loading weights:   0%|          | 0/2763 [00:00<?, ?it/s]Loading weights:  42%|████▏     | 1156/2763 [00:00<00:00, 11551.75it/s]Loading weights:  84%|████████▎ | 2312/2763 [00:00<00:00, 11110.47it/s]Loading weights: 100%|██████████| 2763/2763 [00:00<00:00, 11236.67it/s]
-I0000 00:00:1785017417.297320   20169 pjrt_api.cc:168] The PJRT plugin has PJRT API version 0.113. The framework PJRT API version is 0.113.
-I0000 00:00:1785017418.589473   20169 pjrt_c_api_client.cc:201] PjRtCApiClient created.
-I0000 00:00:1785017422.876249   20639 tier2_compilation_cache.cc:149] Tier-2 compilation cache is disabled for world size 1.
-I0000 00:00:1785017422.876293   20639 tier3_compilation_cache.cc:65] Backup compilation for tier-3 cache read is disabled as tier-3 cache is disabled.
-MARKER compressed module type: Linear
-MARKER   weight_scale: (10240, 80) torch.bfloat16
-MARKER   weight_packed: (10240, 320) torch.int32
-MARKER   weight_shape: (2,) torch.int64
-MARKER swapped 343 modules in 1.7s; packed+scale = 2.23 GB vs bf16 7.95 GB (3.56x smaller)
-Phase 3: CPU bit-exactness check vs reference dequant...
-MARKER cpu dequant max abs diff vs reference: 0.0
-Phase 4: TPU eager dequant check...
-MARKER tpu eager dequant max abs diff: 0.0
-Phase 5: compiled static-shape decode bench...
-Warmup (4 steps, includes compile)...
-Decompressing model: 0it [00:00, ?it/s]Decompressing model: 0it [00:00, ?it/s]
-/usr/local/lib/python3.12/dist-packages/torch/_dynamo/utils.py:3895: UserWarning: TorchTPU only supports FLASH_ATTENTION SDPBackend for scaled_dot_product_attention when these conditions are met:
-- attn_mask is None (current: present)
-- dropout_p is 0.0 (current: 0)
-- inputs are float32 or bfloat16 (current: BFloat16)
-- inputs have the same rank (query: 4, key: 4, value: 4)
-- query rank is at least 4 (current: 4)
-- batch size is at least 1 (current: 1)
-- Sequence lengths (dim - 2) are divisible by 512 (query: 256, key: 256, value: 256)
-- Head dimension (dim - 1) is less than 128 or divisible by 128 (query: 256) (Triggered internally at torch_tpu/ops/scaled_dot_product_attention/scaled_dot_product_attention_aten_kernels.cc:400.)
-  return node.target(*args, **kwargs)  # type: ignore[operator]
-/usr/local/lib/python3.12/dist-packages/torch/_inductor/codecache.py:1074: FutureWarning: `isinstance(treespec, LeafSpec)` is deprecated, use `isinstance(treespec, TreeSpec) and treespec.is_leaf()` instead.
-  yield pickle.loads(content), content, True
-MARKER warmup done in 69.9s
---- output -------------------------------------------------
-TPUs are fast because they are custom-designed by Google specifically for accelerating machine learning workloads, rather than being general-purpose processors. This specialized architecture allows them to perform the massive matrix multiplications central to deep learning with extremely high efficiency and speed.
-------------------------------------------------------------
-MARKER packed w4a16 compiled decode (SEQ=256, no KV cache): 64 steps in 0.88s = 72.4 tok/s (13.8 ms/step)
-I0000 00:00:1785017495.345655   20169 compilation_cache.cc:345] Compilation cache evicted.
-I0000 00:00:1785017495.346789   20169 compilation_cache.cc:209] CompilationCache final stats: num_cache_reqs=282
-num_cache_hits=270 {95.7%}
-peak_compilation_memory_bytes=unknown
-

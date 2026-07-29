@@ -1,6 +1,6 @@
 # 🚀 tpu-skill-claude — TPU Management Skill & MCP Agent
 
-This repository packages the **`tpu-management` Claude Code skill** and the **`tpu-devops` MCP server**: an AI DevOps/SRE agent for operating Google Cloud TPU capacity, **Gemma 4** vLLM serving, and **PyTorch (TorchTPU)** workloads on TPU VMs. It finds and provisions TPU capacity (flex-start VMs, queued resources), starts and debugs vLLM, provisions PyTorch/TorchTPU dev VMs (`workload="pytorch"`), verifies model health, runs benchmarks, analyzes logs with the self-hosted Gemma 4 model, and tears everything down safely.
+This repository packages the **`tpu-management` Claude Code skill** and the **`tpu-devops` MCP server**: an AI DevOps/SRE agent for operating Google Cloud TPU capacity, **Gemma 4** vLLM serving, and bare **JAX** dev VMs on TPU. It finds and provisions TPU capacity (flex-start VMs, queued resources), starts and debugs vLLM, provisions JAX dev VMs (`workload="jax"`), verifies model health, runs benchmarks, analyzes logs with the self-hosted Gemma 4 model, and tears everything down safely.
 
 **GitHub:** https://github.com/xbill9/tpu-skill-claude
 
@@ -98,7 +98,6 @@ Because installs are refresh-and-copy (not symlinks), an installed copy goes sta
 The `tpu-devops` MCP server covers the full TPU serving lifecycle (catalog with usage guidance in [SKILL.md](.claude/skills/tpu-management/SKILL.md), live listing via the `get_help` tool):
 
 - **Capacity discovery & provisioning:** sweep zones for available capacity (`find_tpu_vm` for flex-start VMs, `find_tpu` for queued resources), check quotas (`get_zones_with_available_quota`), estimate cost, create flex-start TPU VMs (v6e/v5p) or legacy queued resources (v5e) with an auto-serving startup script, then `wait_for_vllm_ready` until the model is up.
-- **PyTorch (TorchTPU) workloads:** create flex-start VMs with `workload="pytorch"` — the startup script installs PyTorch + the TorchTPU backend (no docker, no HF token) and smoke-tests `torch.compile(backend="tpu")`; `wait_for_pytorch_ready` polls until ready and `verify_pytorch_tpu` reruns the smoke test over SSH.
 - **Serving stack control:** manage the vLLM Docker container (`manage_vllm_docker` — works on both flex-start VMs and queued-resource nodes), fetch endpoints and the gcloud deployment one-liner, store the HF token in Secret Manager.
 - **Health, logs & diagnostics:** system status dashboard covering both serving paths, model health verification, vLLM/docker/system/serial logs, Cloud Logging retrieval, and Gemma-4-powered log triage (`analyze_cloud_logging`).
 - **Inference & benchmarking:** query the deployed Gemma 4 endpoint (optional TTFT/throughput stats), run `vllm bench serve` for benchmark metrics.
@@ -122,7 +121,7 @@ Edit the repo-root sources (`server.py`, `tpu.md`, `project-setup.sh`), then run
 
 ## ⚙️ Configuration
 
-The server reads its configuration from environment variables: `GOOGLE_CLOUD_PROJECT` (falls back to the active gcloud config), `GOOGLE_CLOUD_ZONE` (default `europe-west4-a`), `GOOGLE_CLOUD_REGION`, `MODEL_NAME`, `ACCELERATOR_TYPE`, `TENSOR_PARALLEL_SIZE`, and `TORCH_TPU_PIP_SPEC` / `TORCH_TPU_INDEX` (packages and authenticated Artifact Registry pip index the `workload="pytorch"` startup script installs from; default package `torch_tpu`). Prerequisites: `pip install -r requirements.txt`, an authenticated `gcloud` CLI with alpha components, the TPU API enabled, and — for vLLM serving only — a Hugging Face token stored as Secret Manager secret `hf-token` (the `save_hf_token` tool does this for you).
+The server reads its configuration from environment variables: `GOOGLE_CLOUD_PROJECT` (falls back to the active gcloud config), `GOOGLE_CLOUD_ZONE` (default `europe-west4-a`), `GOOGLE_CLOUD_REGION`, `MODEL_NAME`, `ACCELERATOR_TYPE`, `TENSOR_PARALLEL_SIZE`. Prerequisites: `pip install -r requirements.txt`, an authenticated `gcloud` CLI with alpha components, the TPU API enabled, and — for vLLM serving only — a Hugging Face token stored as Secret Manager secret `hf-token` (the `save_hf_token` tool does this for you).
 
 ---
 

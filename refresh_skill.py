@@ -8,7 +8,7 @@ Regenerates:
                                                             from  tpu.md
                                                             (base64 screenshots stripped)
 
-SKILL.md, mcp/startup_script_template.sh, and mcp/startup_script_pytorch_template.sh
+SKILL.md and mcp/startup_script_template.sh
 are hand-maintained and left alone.
 """
 
@@ -53,7 +53,7 @@ def main() -> int:
     print(f"copied project-setup.sh -> {(SKILL / 'mcp' / 'project-setup.sh').relative_to(ROOT)}")
     shutil.copyfile(ROOT / "requirements.txt", SKILL / "mcp" / "requirements.txt")
     print(f"copied requirements.txt -> {(SKILL / 'mcp' / 'requirements.txt').relative_to(ROOT)}")
-    guide_src = ROOT / "tpu.md" if (ROOT / "tpu.md").exists() else ROOT / "pytorch.md"
+    guide_src = ROOT / "tpu.md"
     if guide_src.exists():
         build_guide(guide_src, SKILL / "references" / "tpu-guide.md")
     return 0

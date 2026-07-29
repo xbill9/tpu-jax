@@ -1,9 +1,8 @@
-# Serving Sweep — Gemma 4 E2B / E4B / 12B on TPU v6e-1: vLLM × TorchTPU
+# Serving Sweep — Gemma 4 E2B / E4B / 12B on TPU v6e-1 (vLLM)
 
 **Run:** 2026-07-25 · `vllm-sweep-vm` (ct6e-standard-1t, flex-start, europe-west4-a, `comglitn`), deleted after collection
 **Matrix:** 3 models × 7 concurrency levels {1,2,4,8,16,32,64} × 13 context lengths {8…65536}, output 128 tok/cell, greedy (`--ignore-eos`)
 **Coverage: 252 measured cells, 0 failed, 42 infeasible-by-hardware** (recorded, not silently skipped). Full matrices in [`tables.md`](tables.md), raw JSONs in `results/`, per-cell logs on request from `sweep-main.tgz`/`sweep-fixup.tgz`.
-**Companion:** TorchTPU single-stream + batched-loop numbers from [`../2026-07-25-torchtpu-e2b-v6e1/REPORT.md`](../2026-07-25-torchtpu-e2b-v6e1/REPORT.md) and `logs/batch-sweep.log` (same day, same chip type, same zone).
 
 ## 1. The chip decides what each model is
 
@@ -28,47 +27,20 @@ For every model, throughput scales almost linearly with users until the KV budge
 
 TTFT stays interactive (< 200 ms median) everywhere except the ≥16K rows, where prefill dominates (E2B 64K: 1.4–17 s depending on load).
 
-## 3. TorchTPU vs vLLM — the two regimes
-
-**Batch 1: identical.** Same chip, same models, measured hours apart:
-
-| Model | TorchTPU compiled loop | vLLM engine (ctx 128, c=1) |
-| :--- | ---: | ---: |
-| E2B | 225 tok/s (4.5 ms/step) | 211 tok/s (4.7 ms TPOT) |
-| E4B | 114 tok/s (8.8 ms) | 111 tok/s (8.9 ms) |
-| 12B | 45.2 tok/s (22.1 ms) | 45.3 tok/s (22.0 ms) |
-
-Single-stream decode is compute-bound; the stack doesn't matter. (TorchTPU eager, for contrast: ~3 tok/s on all three.)
-
-**Concurrency: two different worlds.** E2B aggregate output tok/s at matching user counts:
-
-| Users | TorchTPU static batch (no KV cache) | vLLM continuous batching | vLLM advantage |
-| ---: | ---: | ---: | ---: |
-| 1 | 225 | 211 | 0.9× |
-| 2 | 390 | 419 | 1.1× |
-| 4 | 450 | 828 | 1.8× |
-| 8 | **493 (peak)** | 1,554 | 3.2× |
-| 16 | 474 | 2,224 | 4.7× |
-| 32 | 427 | 2,451 | 5.7× |
-| 64 | 392 | 2,452 | **6.3×** |
-
-The static-batch loop doubles once (B=2) then saturates near 500 tok/s and *declines* — without a KV cache, every added stream re-pays full-sequence attention every step. vLLM keeps scaling to 2,500. The lesson is crisp: **TorchTPU's batch story ends where KV caching begins**; beyond ~2–4 lockstep streams you either implement a real KV cache or use the engine that has one.
-
-## 4. Practical guidance
+## 3. Practical guidance
 
 - **Shared/multi-user endpoint** → vLLM, any model. 6× throughput at c=64, $0.15/M tokens at E2B saturation.
-- **Single stream, latency-sensitive, or vLLM-unsupported checkpoints (QAT)** → TorchTPU compiled loop is engine-equivalent at batch 1 and up to ~2 lockstep users.
+- **vLLM-unsupported checkpoints (QAT)** → see the pure-JAX engine (`ports/gemma4/jax_e_model.py`); vLLM's TPU loader cannot load Gemma 4 QAT exports (tpu-inference #3225).
 - **Model pick on one v6e-1**: E2B is the throughput/context king; E4B costs ~2× per token for one quality step up; 12B costs ~5× per token, caps at 8K context, and really wants a v6e-4.
 - **Interactive long-context (≥16K)**: budget seconds of TTFT per request; keep concurrency ≤ 8 on E2B/E4B.
 
-## 5. Method notes & caveats
+## 4. Method notes & caveats
 
 - Random-token prompts (`vllm bench serve --dataset-name random`), fixed 128-token output, `--ignore-eos`; one run per cell (the 07-21 baseline measured run-to-run cv ≤ 0.3 % for this stack). Prompt-count per cell scales down with context (8×users → 1×users) to bound prefill time; absolute aggregates at high ctx are conservative.
 - The "64K" row is effective input 65,376 (max-model-len 65,536 − output − margin); the naive 65,536-input cells are impossible by construction and were re-measured in a fix-up pass.
 - 12B rows ≥ 8K context are infeasible at bf16 on 32 GB (vLLM cannot boot the KV cache) — a quantized 12B would change this picture.
-- TorchTPU batch numbers use the no-KV-cache 256-token loop; they measure that design's ceiling, not TorchTPU's theoretical best with a hand-built KV cache.
-- vLLM: `vllm/vllm-tpu:nightly` (tpu-inference JAX backend); TorchTPU: `0.1.1.dev20260725090141` + torch 2.11.0+cpu.
+- vLLM: `vllm/vllm-tpu:nightly` (tpu-inference JAX backend).
 
-## 6. Session cost
+## 5. Session cost
 
-Two flex-start v6e-1 VMs, both deleted after collection: `torchtpu-vm` ~1.6 h + `vllm-sweep-vm` ~4.1 h ≈ **$7.70 total** for 252 serving cells + 13 TorchTPU benchmark configurations.
+Flex-start v6e-1 `vllm-sweep-vm` ~4.1 h ≈ **$5.54** for 252 serving cells.

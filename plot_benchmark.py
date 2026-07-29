@@ -1,4 +1,23 @@
 #!/usr/bin/env python3
+"""RETRACTED DATA — do not regenerate the published chart from this file.
+
+The numbers hard-coded below came from ``jax_e_benchmark_sweep.py``, which had
+three methodology defects (see that file's module docstring and
+``jax_e_benchmark_sweep_v2.py``):
+
+  1. prefill was timed on an un-jitted call, so it measured dispatch overhead
+     (tell: 512x more context moved "prefill" only 1.43x, 544 ms -> 779 ms);
+  2. "decode step latency" was total_scan_time/16 with the prefill inside it;
+  3. the decode steps ran with NO KV cache, so they never attended to history.
+
+The B=1 column is additionally self-inconsistent: reconstructed wall time is
+304.6 ms for one sequence versus 109.1 ms for two, i.e. the smaller batch is
+2.8x slower in absolute terms. MXU underutilization cannot produce that, so the
+"2.7x per-user speedup" derived from it does not hold.
+
+Re-run ``jax_e_benchmark_sweep_v2.py`` on a TPU VM and replot from its
+``--json-out`` before publishing any chart.
+"""
 import matplotlib.pyplot as plt
 import numpy as np
 

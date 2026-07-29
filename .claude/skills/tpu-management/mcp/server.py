@@ -68,34 +68,26 @@ MODEL_NAME = os.getenv("MODEL_NAME", "google/gemma-4-31B-it")
 HF_SECRET_ID = "hf-token"
 ACCELERATOR_TYPE = os.getenv("ACCELERATOR_TYPE", "v6e-8")
 TENSOR_PARALLEL_SIZE = int(os.getenv("TENSOR_PARALLEL_SIZE", "8"))
-# Packages the pytorch-workload startup script installs, per the TorchTPU
-# quickstart (github.com/google-pytorch/torch_tpu): torch_tpu comes from a
-# private Artifact Registry index (token spliced in at boot) and pulls the
-# matching CPU torch automatically — never add torch itself here. Extend for
-# extras (e.g. "torch_tpu transformers") or pins without editing the template.
-# torch==2.11.0+cpu pin: the nightly torch_tpu wheels leave their torch
-# dependency unconstrained, so pip otherwise resolves a newer torch whose ABI
-# the extension .so wasn't built against (verified failure on 2.13). Drop the
-# pin when upstream constrains it.
-TORCH_TPU_PIP_SPEC = os.getenv("TORCH_TPU_PIP_SPEC", "torch_tpu torch==2.11.0+cpu")
-TORCH_TPU_INDEX = os.getenv(
-    "TORCH_TPU_INDEX",
-    "us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/",
+# Bare JAX dev VMs (workload="jax"). No docker, no vLLM, no HF token.
+# Ubuntu 22.04's system interpreter is 3.10, which pins JAX to an old release;
+# the startup script installs this version from deadsnakes instead and pip-installs
+# into it directly (no venv, per this repo's standard).
+JAX_PYTHON_VERSION = os.getenv("JAX_PYTHON_VERSION", "3.13")
+# libtpu resolves from the JAX releases index, not PyPI — the startup script
+# passes -f for it. Pin here (e.g. "jax[tpu]==0.11.0") for reproducible runs.
+JAX_PIP_SPEC = os.getenv("JAX_PIP_SPEC", "jax[tpu]")
+# Best-effort extras installed after the TPU stack; failure is non-fatal.
+# CPU debug boxes: correctness work off the TPU. Memory is the spec that matters —
+# 31B at W4A16 is ~16 GiB of weights, so 32 GiB of host RAM is the useful floor;
+# e2-highmem-4 is the cheapest tier that clears it (8 GiB per vCPU, no wasted cores).
+CPU_DEBUG_MACHINE_TYPE = os.getenv("CPU_DEBUG_MACHINE_TYPE", "e2-highmem-4")
+CPU_DEBUG_PIP_SPEC = os.getenv(
+    "CPU_DEBUG_PIP_SPEC",
+    "jax numpy scipy ml_dtypes safetensors huggingface_hub transformers",
 )
-# Project-owned GCS mirror of the two private wheels (custom torch base +
-# torch_tpu extension, per the TorchTPU GDE quickstart's wheel install path).
-# The startup script tries this FIRST: the default compute SA typically cannot
-# read Google's Artifact Registry (no grantable IAM), but a bucket in our own
-# project is. Missing bucket/objects fall through to the index. Empty disables.
-TORCH_TPU_WHEELS_GCS = os.getenv("TORCH_TPU_WHEELS_GCS", f"gs://{PROJECT_ID}-torchtpu-wheels")
-# Public-PyPI extras installed after the TPU stack: the standard kit for the
-# QAT / custom-kernel work (compressed-tensors checkpoints, Pallas via jax,
-# chat templates need jinja2>=3.1). Best-effort at boot; failure is non-fatal.
-TORCH_TPU_PIP_EXTRAS = os.getenv(
-    "TORCH_TPU_PIP_EXTRAS",
-    # setuptools<81: tensorboard/xprof need pkg_resources (removed in 81).
-    "transformers compressed-tensors 'jinja2>=3.1' jax "
-    "'setuptools<81' xprof tensorboard-plugin-profile",
+JAX_PIP_EXTRAS = os.getenv(
+    "JAX_PIP_EXTRAS",
+    "numpy scipy ml_dtypes safetensors huggingface_hub",
 )
 
 # find_tpu records per-zone provisioning outcomes here so later sweeps can skip
@@ -229,6 +221,38 @@ async def get_secret(secret_id: str = HF_SECRET_ID) -> Optional[str]:
         return None
 
 
+# Startup-script templates are hand-maintained inside the skill, next to the
+# *deployed* copy of this file. When server.py runs from the repo root instead
+# (tests, `python3 server.py`, an MCP registration pointing at the source), the
+# templates are not siblings — so search the skill directory too rather than
+# failing at VM-creation time with a confusing "no such file".
+_TEMPLATE_SEARCH_DIRS = (
+    os.path.dirname(os.path.abspath(__file__)),
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), ".claude", "skills", "tpu-management", "mcp"),
+)
+
+
+def _read_template(filename: str) -> str:
+    """Returns the contents of a startup-script template.
+
+    Raises RuntimeError naming every location searched; callers must not create
+    infrastructure with a missing or broken startup script.
+    """
+    tried = []
+    for directory in _TEMPLATE_SEARCH_DIRS:
+        path = os.path.join(directory, filename)
+        tried.append(path)
+        if os.path.isfile(path):
+            try:
+                with open(path, "r") as f:
+                    return f.read()
+            except OSError as e:
+                raise RuntimeError(f"Cannot read startup script template {path}: {e}") from e
+    raise RuntimeError(
+        f"Startup script template '{filename}' not found. Searched: " + ", ".join(tried)
+    )
+
+
 def _get_formatted_startup_script(model_name: str, zone: str, tp_size: Optional[int] = None) -> str:
     """Formats the startup script template. The Hugging Face token is NOT interpolated —
     the template fetches it from Secret Manager at boot, so it never lands in instance
@@ -237,10 +261,8 @@ def _get_formatted_startup_script(model_name: str, zone: str, tp_size: Optional[
     Raises RuntimeError if the template is missing or malformed; callers must not
     create infrastructure with a broken startup script.
     """
-    template_path = os.path.join(os.path.dirname(__file__), "startup_script_template.sh")
+    template = _read_template("startup_script_template.sh")
     try:
-        with open(template_path, "r") as f:
-            template = f.read()
         return template.format(
             project_id=PROJECT_ID,
             zone=zone,
@@ -250,32 +272,46 @@ def _get_formatted_startup_script(model_name: str, zone: str, tp_size: Optional[
             limit_mm_per_prompt_env='export VLLM_LIMIT_MM_PER_PROMPT=\'{"image":4,"audio":1}\'',
         )
     except Exception as e:
-        raise RuntimeError(f"Cannot build startup script from {template_path}: {e}") from e
+        raise RuntimeError(f"Cannot render startup_script_template.sh: {e}") from e
 
 
-def _get_pytorch_startup_script(zone: str) -> str:
-    """Formats the PyTorch (TorchTPU) startup script template: installs the torch
-    TPU stack (a dedicated python3.12 interpreter — no venv — with torch_tpu from
-    its authenticated Artifact Registry index) on the bare VM and runs a compile
-    smoke test — no docker, no vLLM, and no Hugging Face token required.
+def _get_cpu_debug_startup_script(zone: str) -> str:
+    """Formats the CPU debug startup script: the same JAX stack as the TPU VMs
+    minus libtpu, plus safetensors/transformers for loading real checkpoints.
+
+    Raises RuntimeError if the template is missing or malformed.
+    """
+    template = _read_template("startup_script_cpu_template.sh")
+    try:
+        return template.format(
+            project_id=PROJECT_ID,
+            zone=zone,
+            python_version=JAX_PYTHON_VERSION,
+            pip_spec=CPU_DEBUG_PIP_SPEC,
+        )
+    except Exception as e:
+        raise RuntimeError(f"Cannot render startup_script_cpu_template.sh: {e}") from e
+
+
+def _get_jax_startup_script(zone: str) -> str:
+    """Formats the bare JAX startup script: installs a current CPython from
+    deadsnakes plus jax[tpu] (libtpu from the JAX releases index) on the bare VM
+    and asserts a TPU device is visible — no docker, no vLLM, no HF token.
 
     Raises RuntimeError if the template is missing or malformed; callers must not
     create infrastructure with a broken startup script.
     """
-    template_path = os.path.join(os.path.dirname(__file__), "startup_script_pytorch_template.sh")
+    template = _read_template("startup_script_jax_template.sh")
     try:
-        with open(template_path, "r") as f:
-            template = f.read()
         return template.format(
             project_id=PROJECT_ID,
             zone=zone,
-            torch_pip_spec=TORCH_TPU_PIP_SPEC,
-            torch_index=TORCH_TPU_INDEX,
-            wheels_gcs=TORCH_TPU_WHEELS_GCS,
-            torch_pip_extras=TORCH_TPU_PIP_EXTRAS,
+            python_version=JAX_PYTHON_VERSION,
+            jax_pip_spec=JAX_PIP_SPEC,
+            jax_pip_extras=JAX_PIP_EXTRAS,
         )
     except Exception as e:
-        raise RuntimeError(f"Cannot build startup script from {template_path}: {e}") from e
+        raise RuntimeError(f"Cannot render startup_script_jax_template.sh: {e}") from e
 
 
 def _write_startup_script(content: str) -> str:
@@ -689,27 +725,29 @@ async def create_tpu_vm_instance(
     max_run_duration: str = "4h",
     request_valid_for: str = "2h",
     workload: Annotated[
-        Literal["vllm", "pytorch"],
-        Field(description="'vllm' serves model_name via docker; 'pytorch' installs the TorchTPU stack for direct torch workloads"),
+        Literal["vllm", "jax"],
+        Field(description="'vllm' serves model_name via docker; 'jax' installs a bare jax[tpu] dev environment (no docker, no HF token)"),
     ] = "vllm",
 ) -> str:
     """Creates a flex-start TPU VM as a GCE instance (recommended path for v6e/v5p).
     workload='vllm' auto-starts Gemma 4 serving via the vLLM startup script;
-    workload='pytorch' instead installs PyTorch + the TorchTPU backend on the bare VM
-    and smoke-tests torch.compile(backend="tpu") — no docker, no HF token needed.
+    workload='jax' instead installs a bare jax[tpu] environment and asserts the TPU
+    is visible — no docker, no HF token, much faster boot.
     Boot disk defaults to 200GB because the image default (10GB) cannot hold the
     vLLM TPU image."""
     zone = _zone(zone)
-    instance_name = instance_name or ("torchtpu-vm" if workload == "pytorch" else "vllm-gemma4-vm")
+    instance_name = instance_name or ("jax-tpu-vm" if workload == "jax" else "vllm-gemma4-vm")
     if accelerator not in _GCE_MACHINE_TYPES:
         supported = ", ".join(sorted(_GCE_MACHINE_TYPES))
         return f"❌ Unsupported accelerator '{accelerator}'. Supported: {supported}"
     machine_type, chips = _GCE_MACHINE_TYPES[accelerator]
 
     selected_model = model_name or MODEL_NAME
-    if workload == "pytorch":
+    if workload == "jax":
+        # No model to size and no gated weights to fetch: skip the chip-count
+        # check and the HF token requirement, neither of which applies.
         try:
-            startup_script_content = _get_pytorch_startup_script(zone)
+            startup_script_content = _get_jax_startup_script(zone)
         except RuntimeError as e:
             return f"❌ Aborted: {e}"
     else:
@@ -773,11 +811,11 @@ async def create_tpu_vm_instance(
                 "find alternatives with `get_zones_with_available_quota`)"
             )
         return f"❌ Creation failed: {stderr}{hint}"
-    if workload == "pytorch":
+    if workload == "jax":
         return (
             f"🚀 Flex-start TPU VM `{instance_name}` ({machine_type}, {chips} chip(s)) created in {zone}; "
-            f"installing PyTorch + TorchTPU (`{TORCH_TPU_PIP_SPEC}`). Follow with `wait_for_pytorch_ready` "
-            f"or `get_tpu_vm_serial_log`, then `verify_pytorch_tpu`; the VM self-deletes at "
+            f"installing Python {JAX_PYTHON_VERSION} + `{JAX_PIP_SPEC}`. Follow with `wait_for_jax_ready` "
+            f"or `get_tpu_vm_serial_log`, then `verify_jax_tpu`; the VM self-deletes at "
             f"max-run-duration ({max_run_duration}).\n{stdout}"
         )
     return (
@@ -832,8 +870,7 @@ async def get_tpu_vm_serial_log(
 ) -> str:
     """Tails the serial-console output of a GCE TPU VM. SSH to TPU VMs is often blocked by
     firewall policy, so this is the primary way to watch startup-script/vLLM boot progress.
-    Success markers: 'vLLM application startup complete.' (vllm workload) or
-    'TorchTPU environment ready.' (pytorch workload)."""
+    Success marker: 'vLLM application startup complete.'"""
     zone = _zone(zone)
     cmd = [
         "gcloud",
@@ -850,7 +887,7 @@ async def get_tpu_vm_serial_log(
     lines = stdout.splitlines()
     # Show output from the most recent startup-script run when a marker is present.
     for i in range(len(lines) - 1, -1, -1):
-        if "Starting Queued vLLM Bootloader" in lines[i] or "Starting TorchTPU Bootloader" in lines[i]:
+        if "Starting Queued vLLM Bootloader" in lines[i]:
             lines = lines[i:]
             break
     return "\n".join(lines[-tail:]) if lines else "No serial output available yet."
@@ -948,112 +985,166 @@ async def wait_for_vllm_ready(
         await asyncio.sleep(30)
 
 
-@mcp.tool(title="Wait for PyTorch/TorchTPU ready", annotations=READ_ONLY)
-async def wait_for_pytorch_ready(
-    instance_name: str = "torchtpu-vm",
+@mcp.tool(title="Create CPU debug VM", annotations=WRITE)
+async def create_cpu_debug_vm(
+    instance_name: str = "gemma-debug",
+    zone: Optional[str] = None,
+    machine_type: Annotated[
+        str,
+        Field(description="GCE machine type; memory is what matters. e2-highmem-4 = 4 vCPU/32 GiB"),
+    ] = CPU_DEBUG_MACHINE_TYPE,
+    boot_disk_size_gb: Annotated[
+        int, Field(ge=50, description="Checkpoints are large: E2B ~8 GB, 31B W4A16 ~16-20 GB, MoE ~14 GB")
+    ] = 250,
+    spot: Annotated[
+        bool, Field(description="Spot is ~70% cheaper and preemption is harmless for a debug box")
+    ] = True,
+    max_run_duration: Annotated[
+        Optional[str],
+        Field(description="Auto-delete after this long, e.g. '8h'. Omit to leave it running."),
+    ] = None,
+) -> str:
+    """Creates a plain CPU VM for correctness work — no TPU, no accelerator cost.
+
+    The JAX engine runs unchanged on the CPU backend (`w4a16_impl` defaults to the
+    reference path, Pallas auto-switches to interpret mode), so architecture and
+    loader bugs reproduce here at a fraction of TPU rates. Use the TPU only for
+    questions whose answer is a time or a memory ceiling.
+
+    Memory is the spec that decides what you can debug:
+      * ~8 GiB  — E2B/E4B dense
+      * ~32 GiB — 31B and 26B MoE at W4A16 (~16 GiB and ~13.6 GiB of weights)
+    Host RAM does NOT predict HBM: XLA:CPU allocates differently and can use
+    virtual memory, so a model that loads here may still OOM on a v6e-1.
+
+    Spot instances use termination-action=STOP so the boot disk (and its cached
+    checkpoints) survives preemption — restart the instance to carry on.
+    """
+    zone = _zone(zone)
+    try:
+        startup_script_content = _get_cpu_debug_startup_script(zone)
+    except RuntimeError as e:
+        return f"❌ Aborted: {e}"
+    script_file = _write_startup_script(startup_script_content)
+
+    create_cmd = [
+        "gcloud", "compute", "instances", "create", instance_name,
+        f"--project={PROJECT_ID}",
+        f"--zone={zone}",
+        f"--machine-type={machine_type}",
+        "--image-project=ubuntu-os-cloud",
+        "--image-family=ubuntu-2204-lts",
+        f"--boot-disk-size={boot_disk_size_gb}GB",
+        "--boot-disk-type=pd-balanced",
+        # cloud-platform so the box can read the hf-token secret the same way the
+        # TPU VMs do; the default compute SA already holds secretAccessor.
+        "--scopes=cloud-platform",
+        f"--metadata-from-file=startup-script={script_file}",
+    ]
+    if spot:
+        create_cmd += ["--provisioning-model=SPOT", "--instance-termination-action=STOP"]
+    if max_run_duration:
+        create_cmd += [f"--max-run-duration={max_run_duration}",
+                       "--instance-termination-action=DELETE"]
+
+    logger.info(f"Executing gcloud command: {' '.join(shlex.quote(c) for c in create_cmd)}")
+    rc, stdout, stderr = await run_command(create_cmd, timeout=600)
+    if rc != 0:
+        return f"❌ Creation failed: {stderr}"
+
+    kind = "Spot" if spot else "on-demand"
+    life = f"; self-deletes at {max_run_duration}" if max_run_duration else "; runs until you delete it"
+    return (
+        f"🖥️ CPU debug VM `{instance_name}` ({machine_type}, {kind}) created in {zone}"
+        f"{life}. Installing Python {JAX_PYTHON_VERSION} + `{CPU_DEBUG_PIP_SPEC}`.\n"
+        f"Follow with `wait_for_jax_ready(instance_name='{instance_name}')`, then "
+        f"`destroy_tpu_vm_instance('{instance_name}')` when done "
+        f"(it deletes any GCE instance, TPU or not).\n{stdout}"
+    )
+
+
+@mcp.tool(title="Wait for JAX TPU ready", annotations=READ_ONLY)
+async def wait_for_jax_ready(
+    instance_name: str = "jax-tpu-vm",
     zone: Optional[str] = None,
     timeout_minutes: Annotated[int, Field(ge=1, le=30)] = 10,
 ) -> str:
-    """Polls a workload='pytorch' flex-start TPU VM every 30s until the startup script
-    reports 'TorchTPU environment ready.' on the serial console (torch installed and
-    the compile smoke test passed). Fails fast if the script logs an ERROR."""
+    """Polls a workload='jax' flex-start TPU VM every 20s until its startup script
+    reports the JAX environment ready (serial-console marker). Fails fast on the
+    script's FAILED marker instead of waiting out the timeout — the script only
+    emits the ready marker after asserting a TPU device is actually visible."""
     zone = _zone(zone)
     deadline = time.monotonic() + timeout_minutes * 60
     last_signal = "no serial output yet"
+
+    def emitted(serial: str, marker: str) -> bool:
+        """True only if the script *printed* the marker.
+
+        The startup script runs under `set -x`, so the shell echoes each command
+        before running it. A traced line can contain a marker string verbatim
+        (the ERR trap's own definition contains the FAILED marker), which would
+        otherwise read as a failure on a healthy boot. Trace lines are prefixed
+        with '+', so skip them.
+        """
+        for line in serial.splitlines():
+            body = line.split("startup-script:", 1)[-1].strip()
+            if body.startswith("+"):
+                continue
+            if marker in body:
+                return True
+        return False
+
     while True:
-        serial = await get_tpu_vm_serial_log(instance_name, zone=zone, tail=40)
-        if "TorchTPU environment ready." in serial:
+        serial = await get_tpu_vm_serial_log(instance_name, zone=zone, tail=60)
+        if emitted(serial, "environment ready."):
             return (
-                f"🟢 TorchTPU environment ready on `{instance_name}`. Verify any time with "
-                "`verify_pytorch_tpu`; run workloads over SSH with the system python3."
+                f"🟢 JAX environment ready on `{instance_name}`. "
+                "Verify with `verify_jax_tpu`; run workloads over SSH with "
+                f"`python{JAX_PYTHON_VERSION}`."
             )
-        error_lines = [line for line in serial.splitlines() if line.startswith("ERROR:")]
-        if error_lines:
-            return f"❌ Startup failed on `{instance_name}`:\n" + "\n".join(error_lines)
+        if emitted(serial, "JAX-BOOTLOADER: FAILED"):
+            detail = [ln for ln in serial.splitlines() if "JAX-BOOTLOADER: ERROR" in ln or ln.startswith("ERROR:")]
+            return (
+                f"❌ JAX startup failed on `{instance_name}`:\n" + "\n".join(detail or ["see `get_tpu_vm_serial_log`"])
+            )
         if not serial.startswith("❌") and serial.strip():
             last_signal = serial.splitlines()[-1]
-
         if time.monotonic() >= deadline:
             return (
                 f"⏳ Not ready after {timeout_minutes} min. Last serial output: {last_signal}\n"
                 "Keep watching with `get_tpu_vm_serial_log`."
             )
-        await asyncio.sleep(30)
+        await asyncio.sleep(20)
 
 
-@mcp.tool(title="Verify PyTorch sees the TPU", annotations=READ_ONLY)
-async def verify_pytorch_tpu(
-    instance_name: Optional[str] = "torchtpu-vm",
-    resource_id: str = "vllm-gemma4-qr",
+@mcp.tool(title="Verify JAX sees the TPU", annotations=READ_ONLY)
+async def verify_jax_tpu(
+    instance_name: str = "jax-tpu-vm",
     zone: Optional[str] = None,
 ) -> str:
-    """Reruns the TorchTPU smoke test (/opt/torchtpu_smoke.py, installed by the
-    pytorch startup script) on the VM over SSH: checks torch.accelerator sees the
-    TPU and a torch.compile(backend="tpu") matmul runs. Targets a GCE flex-start VM
-    via instance_name (default) or a queued resource's node via resource_id when
-    instance_name is None/empty."""
+    """Re-runs the JAX TPU check on the VM over SSH: reports jax/jaxlib/libtpu
+    versions and the device list, and fails if no TPU device is visible.
+
+    Importing jax succeeds even with no TPU backend, so this asserts on
+    jax.devices() rather than on the import."""
     zone = _zone(zone)
-    remote_cmd = (
-        "if command -v python3.12 >/dev/null && [ -f /opt/torchtpu_smoke.py ]; then "
-        "python3.12 /opt/torchtpu_smoke.py; "
-        "else echo 'ERROR: TorchTPU env not found — was this VM created with workload=pytorch?'; exit 1; fi"
+    probe = (
+        "import jax, sys;"
+        "import importlib.metadata as md;"
+        "devs = jax.devices();"
+        "print('jax', jax.__version__, '| libtpu', md.version('libtpu') if any(d.platform=='tpu' for d in devs) else 'n/a');"
+        "print('devices:', devs);"
+        "sys.exit(0 if any(d.platform=='tpu' for d in devs) else 1)"
     )
-    argv, target = await _build_tpu_ssh_cmd(remote_cmd, resource_id, instance_name, zone)
+    remote = f"python{JAX_PYTHON_VERSION} -c {shlex.quote(probe)}"
+    argv, target = await _build_tpu_ssh_cmd(remote, "", instance_name, zone)
     if argv is None:
         return target
-    rc, stdout, stderr = await run_command(argv, timeout=300)
+    rc, stdout, stderr = await run_command(argv, timeout=180)
     output = "\n".join(part for part in (stdout, stderr) if part).strip()
     if rc != 0:
-        return f"❌ TorchTPU smoke test failed on `{target}`:\n{output}"
-    return f"🟢 TorchTPU smoke test passed on `{target}`:\n{output}"
-
-
-@mcp.tool(title="Update TorchTPU wheels", annotations=WRITE)
-async def update_torchtpu(
-    instance_name: Optional[str] = "torchtpu-vm",
-    resource_id: str = "vllm-gemma4-qr",
-    zone: Optional[str] = None,
-    version: Annotated[
-        Optional[str],
-        Field(description="Pin torch_tpu to this exact version; omit for the latest nightly"),
-    ] = None,
-) -> str:
-    """Upgrades torch_tpu in place on a workload='pytorch' VM: fetches a fresh
-    access token from the metadata server, pip-installs the latest nightly (or
-    `version` if pinned) from the authenticated index, reports the old -> new
-    version, and reruns the compile smoke test. The paired CPU torch bumps
-    automatically as a dependency; the first compile after an upgrade is slow
-    (compilation cache invalidated). For a clean slate, recreating the VM also
-    installs the latest nightly. Targets a GCE flex-start VM via instance_name
-    (default) or a queued resource's node via resource_id when instance_name is
-    None/empty."""
-    zone = _zone(zone)
-    pkg_spec = f"torch_tpu=={version}" if version else TORCH_TPU_PIP_SPEC
-    remote_cmd = (
-        "set -e; "
-        "if ! command -v python3.12 >/dev/null || [ ! -f /opt/torchtpu_smoke.py ]; then "
-        "echo 'ERROR: TorchTPU env not found — was this VM created with workload=pytorch?'; exit 1; fi; "
-        'TOKEN=$(curl -sf -H "Metadata-Flavor: Google" '
-        '"http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token" '
-        "| python3 -c 'import json,sys; print(json.load(sys.stdin)[\"access_token\"])'); "
-        '[ -n "$TOKEN" ] || { echo "ERROR: could not fetch a metadata access token"; exit 1; }; '
-        "OLD=$(python3.12 -m pip show torch_tpu 2>/dev/null | sed -n 's/^Version: //p'); "
-        "python3.12 -m pip install --upgrade --pre --break-system-packages "
-        f'--index-url "https://oauth2accesstoken:$TOKEN@{TORCH_TPU_INDEX}" {pkg_spec}; '
-        "NEW=$(python3.12 -m pip show torch_tpu 2>/dev/null | sed -n 's/^Version: //p'); "
-        "echo \"torch_tpu: ${OLD:-none} -> ${NEW:-none}\"; "
-        "echo 'Rerunning smoke test...'; "
-        "python3.12 /opt/torchtpu_smoke.py"
-    )
-    argv, target = await _build_tpu_ssh_cmd(remote_cmd, resource_id, instance_name, zone)
-    if argv is None:
-        return target
-    # Wheel download + first compile can take a while.
-    rc, stdout, stderr = await run_command(argv, timeout=590)
-    output = "\n".join(part for part in (stdout, stderr) if part).strip()
-    if rc != 0:
-        return f"❌ TorchTPU update failed on `{target}`:\n{output}"
-    return f"🟢 TorchTPU updated on `{target}` (smoke test passed):\n{output}"
+        return f"❌ JAX cannot see the TPU on `{target}`:\n{output}"
+    return f"🟢 JAX sees the TPU on `{target}`:\n{output}"
 
 
 async def _get_zones_with_available_quota_list(
@@ -1280,8 +1371,8 @@ async def find_tpu_vm(
         str, Field(description="How long each zone's flex-start request stays valid, e.g. '5m'")
     ] = "5m",
     workload: Annotated[
-        Literal["vllm", "pytorch"],
-        Field(description="'vllm' serves model_name via docker; 'pytorch' installs the TorchTPU stack for direct torch workloads"),
+        Literal["vllm", "jax"],
+        Field(description="'vllm' serves model_name via docker; 'jax' installs a bare jax[tpu] dev environment (no docker, no HF token)"),
     ] = "vllm",
 ) -> str:
     """GCE counterpart of `find_tpu`: tries flex-start TPU VM creation across zones
@@ -1289,8 +1380,8 @@ async def find_tpu_vm(
     attempting creation, so quota failures fail fast and the sweep moves on; each
     attempt's request expires after `per_zone_wait` so no pending requests pile up.
     On success, switches the server's default zone to the winning zone. Follow up
-    with `wait_for_vllm_ready` (or `wait_for_pytorch_ready` for workload='pytorch')."""
-    instance_name = instance_name or ("torchtpu-vm" if workload == "pytorch" else "vllm-gemma4-vm")
+    with `wait_for_vllm_ready` (or `wait_for_jax_ready` for workload='jax')."""
+    instance_name = instance_name or ("jax-tpu-vm" if workload == "jax" else "vllm-gemma4-vm")
     candidate_zones = zones or await _get_zones_with_available_quota_list()
     if not candidate_zones:
         return "❌ No candidate zones: no zones with TPU quota found — pass `zones` explicitly."
@@ -1970,31 +2061,34 @@ async def get_help() -> str:
         f"  - *Current Value:* `{ACCELERATOR_TYPE}`\n"
         f"- **`TENSOR_PARALLEL_SIZE`**: Tensor parallel size for serving.\n"
         f"  - *Current Value:* `{TENSOR_PARALLEL_SIZE}`\n"
-        f"- **`TORCH_TPU_PIP_SPEC`**: Pip packages installed by workload='pytorch' VMs "
-        "(torch_tpu pulls the matching CPU torch automatically — never add torch here).\n"
-        f"  - *Current Value:* `{TORCH_TPU_PIP_SPEC}`\n"
-        f"- **`TORCH_TPU_INDEX`**: Artifact Registry pip index for torch_tpu (token spliced in at boot).\n"
-        f"  - *Current Value:* `{TORCH_TPU_INDEX}`\n"
-        f"- **`TORCH_TPU_WHEELS_GCS`**: project-owned GCS mirror of the torch/torch_tpu wheels; "
-        "tried before the index (the VM SA can read our bucket but usually not Google's registry). "
-        "Empty disables.\n"
-        f"  - *Current Value:* `{TORCH_TPU_WHEELS_GCS}`\n"
-        f"- **`TORCH_TPU_PIP_EXTRAS`**: public-PyPI extras installed after the TPU stack (QAT kit).\n"
-        f"  - *Current Value:* `{TORCH_TPU_PIP_EXTRAS}`\n\n"
+        f"- **`JAX_PYTHON_VERSION`**: CPython installed from deadsnakes on workload='jax' VMs "
+        "(Ubuntu 22.04's system 3.10 pins JAX to an old release).\n"
+        f"  - *Current Value:* `{JAX_PYTHON_VERSION}`\n"
+        f"- **`JAX_PIP_SPEC`**: JAX package spec for workload='jax' VMs; libtpu resolves from the "
+        "JAX releases index. Pin it (e.g. `jax[tpu]==0.11.0`) for reproducible runs.\n"
+        f"  - *Current Value:* `{JAX_PIP_SPEC}`\n"
+        f"- **`JAX_PIP_EXTRAS`**: best-effort extras installed after the TPU stack (non-fatal).\n"
+        f"  - *Current Value:* `{JAX_PIP_EXTRAS}`\n"
+        f"- **`CPU_DEBUG_MACHINE_TYPE`**: machine type for `create_cpu_debug_vm`. Memory is the "
+        "spec that matters — 32 GiB covers 31B/26B-MoE at W4A16.\n"
+        f"  - *Current Value:* `{CPU_DEBUG_MACHINE_TYPE}`\n"
+        f"- **`CPU_DEBUG_PIP_SPEC`**: packages installed on CPU debug boxes (no libtpu).\n"
+        f"  - *Current Value:* `{CPU_DEBUG_PIP_SPEC}`\n"
         "A Hugging Face token must exist as Secret Manager secret `hf-token` "
         "(save one with `save_hf_token`) before vLLM resource creation "
-        "(workload='pytorch' VMs don't need it).\n\n"
+        "(workload='jax' VMs don't need it).\n\n"
         "---\n\n"
         "### 🧰 Available MCP Tools\n\n"
         "#### 🐳 Capacity & Lifecycle — GCE flex-start TPU VMs (recommended for v6e/v5p)\n"
         "- **`create_tpu_vm_instance`**: Creates a flex-start TPU VM via GCE; workload='vllm' auto-starts "
-        "serving, workload='pytorch' installs the PyTorch/TorchTPU stack instead.\n"
+        "serving, workload='jax' installs a bare jax[tpu] dev environment instead.\n"
         "- **`find_tpu_vm`**: Sweeps zones attempting flex-start creation until one grants capacity "
         "(same workload choice).\n"
         "- **`wait_for_vllm_ready`**: Polls health endpoint + serial marker until serving is up (~10 min loads).\n"
-        "- **`wait_for_pytorch_ready`**: Polls the serial marker until the TorchTPU environment is ready.\n"
-        "- **`verify_pytorch_tpu`**: Reruns the TorchTPU smoke test (torch.compile backend=\"tpu\") over SSH.\n"
-        "- **`update_torchtpu`**: In-place upgrade of the torch_tpu nightly (or a pinned version) + smoke test.\n"
+        "- **`create_cpu_debug_vm`**: Plain CPU VM (default Spot e2-highmem-4/32 GiB) running the "
+        "same JAX stack minus libtpu — correctness work off the TPU, for cents an hour.\n"
+        "- **`wait_for_jax_ready`**: Polls the serial marker until the JAX environment is ready (or failed).\n"
+        "- **`verify_jax_tpu`**: Re-runs the JAX device check over SSH (asserts jax.devices() sees a TPU).\n"
         "- **`list_tpu_vm_instances`**: Lists GCE TPU VM instances (ct6e/ct5p) with IPs and status.\n"
         "- **`destroy_tpu_vm_instance`**: Deletes a GCE TPU VM instance (stops flex-start billing).\n"
         "- **`get_tpu_vm_serial_log`**: Tails a GCE TPU VM's serial console (boot/vLLM progress when SSH is blocked).\n"

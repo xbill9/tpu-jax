@@ -119,24 +119,50 @@ This workspace includes a high-performance, raw JAX inference engine for **Gemma
 2. **Vectorized On-Chip Top-K Sampling** (`onchip_sample_tpu_v6e_jax`):
    - Leverages Gemma 4 E2B's tile-aligned $262,144$ vocabulary dimension ($2,048 \times 128$), running sampling 100% on TPU cores with zero CPU host transfers.
 3. **Persistent XLA Compilation Disk Cache**:
-   - `jax.config.update("jax_compilation_cache_dir", "~/.cache/jax_compilation_cache")` reduces server cold-start compilation time from ~44s down to **~5s** (**~8.5x speedup**).
+   - `jax.config.update("jax_compilation_cache_dir", "~/.cache/jax_compilation_cache")` persists compiled HLO across restarts, skipping ~17s of XLA compilation on a warm restart.
 4. **OpenAI-Compatible SSE Token Streaming**:
    - Real-time `text/event-stream` token generation supported via `jax_openai_server.py`.
 
-### 📈 Performance Summary Matrix (TPU v6e 32 GB HBM)
+### 📈 Performance Status: RETRACTED, RE-MEASUREMENT REQUIRED
 
-| Users ($B$) | Context ($S$) | Prefill Latency | Step Latency | Aggregate Throughput | Per-User Speed | Max Reachable Context |
-| :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **1** | **8 – 4K** | ~544 ms | 19.04 ms | 52.5 tok/s | 52.5 tok/s | **4,096 tokens** |
-| **2** | **8 – 2K** | ~614 ms | **6.81 ms** | **293.7 tok/s** | **146.8 tok/s** | **2,048 tokens** |
-| **4** | **8 – 1K** | ~654 ms | **6.92 ms** | **577.8 tok/s** | **144.4 tok/s** | **1,024 tokens** |
-| **8** | **8 – 512** | ~651 ms | **6.95 ms** | **1,150.6 tok/s** | **143.8 tok/s** | **512 tokens** |
-| **16** | **8 – 256** | ~597 ms | **7.19 ms** | **2,225.1 tok/s** | **139.1 tok/s** | **256 tokens** |
-| **32** | **8 – 128** | ~604 ms | **8.07 ms** | **3,966.2 tok/s** | **123.9 tok/s** | **128 tokens** |
-| **64** | **8 – 64** | ~701 ms | **9.85 ms** | **6,496.8 tok/s** | **101.5 tok/s** | **64 tokens** |
+The previously published sweep (peak 6,496.8 tok/s; "~2.7x per-user speedup") is
+**withdrawn**. It came from `ports/gemma4/jax_e_benchmark_sweep.py`, which had three
+methodology defects:
 
-### 🔑 Benchmark Takeaways
-- **The ~2.7x Per-User Speedup**: Scaling batch size from $B=1$ (19.04 ms/step, 52.5 tok/s) to $B=2\dots 16$ (~6.8–7.2 ms/step) yields a **2.7x generation speedup per user (~144 tok/s/user)** by fully populating TPU v6e's 128x128 MXU vector lanes.
-- **Peak Throughput**: Reaches **6,496.8 tokens/sec aggregate** at $B=64$ users.
-- **vLLM Compatibility**: Resolves vLLM TPU loader bug `#3225` (missing `k_norm` weights on KV-shared layers in QAT checkpoints), allowing INT8 QAT weights to run live on TPU today with ~5s startup.
+1. **Prefill was timed un-jitted**, measuring op dispatch rather than compute. Tell:
+   a 512x context increase (8 -> 4,096 tokens) moved "prefill" only 1.43x (544 ms ->
+   779 ms). That 544 ms also exceeded the entire jitted generate call (~305 ms) which
+   contained a prefill *plus* 15 decode steps.
+2. **"Decode step latency" was `total_scan_time / 16`**, with the prefill inside that
+   total — which is why per-step cost drifted with context length.
+3. **The decode loop had no KV cache and no attention mask.** Each step ran the model
+   on a single token with no history, so it was not autoregressive decoding.
+
+The B=1 row is additionally self-inconsistent: reconstructed wall time is 304.6 ms for
+one sequence vs 109.1 ms for two — the smaller batch 2.8x slower in absolute terms. MXU
+underutilization predicts roughly equal wall time (~2x aggregate, flat per-user), never
+that.
+
+**Use `ports/gemma4/jax_e_benchmark_sweep_v2.py`** — it times jitted prefill and
+steady-state cached decode separately, discards warmup, and medians over repeats.
+Correctness of the cached decode path is asserted in `tests/test_kv_cache_parity.py`
+(matches full re-forward to ~1e-6 logit delta).
+
+```bash
+python3 ports/gemma4/jax_e_benchmark_sweep_v2.py \
+  --batch-sizes 1,2,4,8,16,32,64 --contexts 8,128,512,2048 --json-out results.json
+```
+
+Expect the OOM frontier to move in versus the old grid: a real KV cache allocates memory
+the old probe never did.
+
+### 🔑 Verified Takeaways
+- **QAT checkpoints load.** The pure-JAX path resolves the vLLM TPU loader failure
+  (`#3225`: `k_norm` demanded for KV-shared layers 15–34 that the checkpoint legitimately
+  omits) and unpacks W4A16 int4 weights with zero PyTorch in the path.
+- **The decoder is verified**, not merely fast: cached decode matches a full-sequence
+  re-forward within float32 roundoff.
+- **vLLM baseline (measured, valid):** 213 tok/s single-stream (16 ms TTFT), ~2,140 tok/s
+  at concurrency 64, ~8.5 min time-to-healthy — see
+  `benchmarks/reports/2026-07-21-gemma4-e2b-v6e1.json`.
 

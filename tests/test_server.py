@@ -63,9 +63,6 @@ class ToolCatalogTests(unittest.TestCase):
             self.tools["estimate_deployment_cost"].inputSchema["properties"]["tpu_type"]["enum"],
             ["v6e", "v5e", "v5p"],
         )
-        for name in ("create_tpu_vm_instance", "find_tpu_vm"):
-            workload = self.tools[name].inputSchema["properties"]["workload"]
-            self.assertEqual(workload["enum"], ["vllm", "pytorch"], name)
 
     def test_log_tails_are_bounded(self):
         for name in ("get_vllm_docker_logs", "get_tpu_system_logs", "get_tpu_vm_serial_log"):
@@ -170,36 +167,33 @@ class StartupTemplateTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
 
 
-class PyTorchStartupTemplateTests(unittest.TestCase):
+class JaxStartupTemplateTests(unittest.TestCase):
+    """The JAX startup script must fail loudly, not print a success marker anyway.
+
+    Regression guard: a hand-rolled precursor of this script omitted `set -e`, its
+    pip step failed on an Ubuntu pip too old for --break-system-packages, and it
+    still emitted the ready marker. The VM looked provisioned and had no JAX.
+    """
+
     def render(self):
         template = (
-            ROOT / ".claude/skills/tpu-management/mcp/startup_script_pytorch_template.sh"
+            ROOT / ".claude/skills/tpu-management/mcp/startup_script_jax_template.sh"
         ).read_text()
         return template.format(
             project_id="test-project",
             zone="europe-west4-a",
-            torch_pip_spec="torch_tpu",
-            torch_index="us-python.pkg.dev/test-registry/simple/",
+            python_version="3.13",
+            jax_pip_spec="jax[tpu]",
+            jax_pip_extras="numpy scipy",
         )
 
     def test_renders_without_leftover_placeholders(self):
         rendered = self.render()
         self.assertNotIn("{project_id}", rendered)
-        self.assertNotIn("{torch_pip_spec}", rendered)
-        self.assertNotIn("{torch_index}", rendered)
-        self.assertIn("torch_tpu", rendered)
-        self.assertIn("us-python.pkg.dev/test-registry/simple/", rendered)
-        self.assertIn("TorchTPU environment ready.", rendered)
-
-    def test_smoke_test_follows_torchtpu_rules(self):
-        """The embedded smoke test must use plain torch (never `import torch_tpu`
-        or PyTorch/XLA) and compile with backend="tpu"."""
-        rendered = self.render()
-        smoke = rendered.split("<< 'PYEOF'")[1].split("PYEOF")[0]
-        self.assertNotIn("import torch_tpu", smoke)
-        self.assertNotIn("torch_xla", smoke)
-        self.assertIn('backend="tpu"', smoke)
-        self.assertIn("bfloat16", smoke)
+        self.assertNotIn("{jax_pip_spec}", rendered)
+        self.assertNotIn("{python_version}", rendered)
+        self.assertIn("test-project", rendered)
+        self.assertIn("python3.13", rendered)
 
     def test_rendered_script_passes_bash_syntax_check(self):
         rendered = self.render()
@@ -207,6 +201,186 @@ class PyTorchStartupTemplateTests(unittest.TestCase):
             ["bash", "-n", "/dev/stdin"], input=rendered, text=True, capture_output=True
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_fails_loudly(self):
+        """set -e plus an ERR trap, and a FAILED marker distinct from the ready one."""
+        rendered = self.render()
+        self.assertRegex(rendered, r"set -eu?x?", "script must exit on error")
+        self.assertIn("trap", rendered)
+        self.assertIn("JAX-BOOTLOADER: FAILED", rendered)
+
+    def test_asserts_a_tpu_is_actually_visible(self):
+        """Importing jax succeeds without a TPU backend, so assert on devices()."""
+        rendered = self.render()
+        self.assertIn("jax.devices()", rendered)
+        self.assertRegex(rendered, r"platform\s*==\s*.tpu.")
+        self.assertIn("sys.exit(1)", rendered)
+
+    def test_ready_marker_comes_after_the_device_assertion(self):
+        rendered = self.render()
+        self.assertLess(
+            rendered.index("jax.devices()"),
+            rendered.index("JAX-BOOTLOADER: TPU environment ready."),
+            "ready marker must not precede the TPU check",
+        )
+
+    def code(self):
+        """Executable lines only — the prose explains what the script avoids."""
+        return "\n".join(
+            ln for ln in self.render().splitlines() if ln.strip() and not ln.lstrip().startswith("#")
+        )
+
+    def test_no_docker_or_hf_token(self):
+        code = self.code()
+        for forbidden in ("docker", "hf-token", "HF_TOKEN", "secretmanager"):
+            self.assertNotIn(forbidden, code, f"bare JAX VM should not run {forbidden}")
+
+    def test_trap_is_installed_before_tracing(self):
+        """`set -x` echoes the trap definition, which contains the FAILED marker.
+
+        If tracing is enabled first, that trace line makes a healthy boot look
+        like a failure to any log scanner (it did, on the first real run).
+        """
+        rendered = self.render()
+        trap_at = rendered.index("trap ")
+        set_x_at = rendered.index("\nset -x")
+        self.assertLess(trap_at, set_x_at, "trap must be installed before `set -x`")
+        self.assertNotIn("set -eux", rendered, "combined -eux re-introduces the trace leak")
+
+    def test_makes_tpu_logs_group_writable(self):
+        """The script runs as root; libtpu's /tmp/tpu_logs would then block users."""
+        rendered = self.render()
+        self.assertIn("/tmp/tpu_logs", rendered)
+        self.assertIn("1777", rendered)
+
+    def test_no_virtualenv(self):
+        """Repo standard: pip into a dedicated interpreter, never a venv."""
+        code = self.code()
+        self.assertNotIn("venv", code)
+        self.assertNotIn("virtualenv", code)
+
+
+class TemplateResolutionTests(unittest.TestCase):
+    """Templates must resolve whether server.py runs deployed or from the repo root.
+
+    The templates are hand-maintained inside the skill, beside the *deployed* copy
+    of server.py. This module imports the repo-root server.py, where they are not
+    siblings — which used to raise FileNotFoundError at VM-creation time.
+    """
+
+    def test_vllm_template_renders_from_repo_root(self):
+        script = server._get_formatted_startup_script(
+            "google/gemma-4-E2B-it", "europe-west4-a", tp_size=1
+        )
+        self.assertIn("vllm", script)
+        proc = subprocess.run(
+            ["bash", "-n", "/dev/stdin"], input=script, text=True, capture_output=True
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_jax_template_renders_from_repo_root(self):
+        script = server._get_jax_startup_script("europe-west4-a")
+        self.assertIn("JAX-BOOTLOADER", script)
+        proc = subprocess.run(
+            ["bash", "-n", "/dev/stdin"], input=script, text=True, capture_output=True
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_missing_template_names_every_location_searched(self):
+        with self.assertRaises(RuntimeError) as ctx:
+            server._read_template("definitely_not_a_template.sh")
+        msg = str(ctx.exception)
+        self.assertIn("definitely_not_a_template.sh", msg)
+        for directory in server._TEMPLATE_SEARCH_DIRS:
+            self.assertIn(directory, msg, "error should name each directory searched")
+
+    def test_deployed_copy_is_a_sibling_of_its_templates(self):
+        """The snapshot server.py must ship next to both templates."""
+        mcp_dir = ROOT / ".claude/skills/tpu-management/mcp"
+        for name in ("server.py", "startup_script_template.sh", "startup_script_jax_template.sh"):
+            self.assertTrue((mcp_dir / name).is_file(), f"{name} missing from the deployed skill")
+
+
+class JaxReadyMarkerScanTests(unittest.TestCase):
+    """Serial-log scanning must distinguish printed markers from `set -x` traces."""
+
+    def scan(self, serial, marker):
+        # Mirror of the closure inside wait_for_jax_ready.
+        for line in serial.splitlines():
+            body = line.split("startup-script:", 1)[-1].strip()
+            if body.startswith("+"):
+                continue
+            if marker in body:
+                return True
+        return False
+
+    def test_traced_trap_definition_is_not_a_failure(self):
+        serial = (
+            "Jul 28 21:22 vm google_metadata_script_runner[1]: startup-script: "
+            "+ trap 'rc=$?; echo \"JAX-BOOTLOADER: FAILED\"; exit $rc' ERR"
+        )
+        self.assertFalse(
+            self.scan(serial, "JAX-BOOTLOADER: FAILED"),
+            "a traced trap definition must not read as a failure",
+        )
+
+    def test_real_failure_is_detected(self):
+        serial = "Jul 28 21:22 vm x[1]: startup-script: JAX-BOOTLOADER: FAILED"
+        self.assertTrue(self.scan(serial, "JAX-BOOTLOADER: FAILED"))
+
+    def test_real_ready_is_detected(self):
+        serial = "Jul 28 21:22 vm x[1]: startup-script: JAX-BOOTLOADER: TPU environment ready."
+        self.assertTrue(self.scan(serial, "JAX-BOOTLOADER: TPU environment ready."))
+
+    def test_traced_echo_of_ready_is_ignored(self):
+        serial = "Jul 28 21:22 vm x[1]: startup-script: + echo 'JAX-BOOTLOADER: TPU environment ready.'"
+        self.assertFalse(self.scan(serial, "JAX-BOOTLOADER: TPU environment ready."))
+
+
+class TemplateBraceHygieneTests(unittest.TestCase):
+    """Startup templates go through str.format(), so stray braces are a landmine.
+
+    Bash brace groups (`{ cmd; }`) and awk programs (`awk '{print $2}'`) both raise
+    KeyError at render time — i.e. at VM-creation time, not in CI. This has bitten
+    twice; the templates avoid braces entirely rather than escaping them.
+    """
+
+    TEMPLATES = {
+        "startup_script_template.sh": {
+            "project_id", "zone", "model_name", "hf_secret_id", "tp_size",
+            "limit_mm_per_prompt_env",
+        },
+        "startup_script_jax_template.sh": {
+            "project_id", "zone", "python_version", "jax_pip_spec", "jax_pip_extras",
+        },
+        "startup_script_cpu_template.sh": {
+            "project_id", "zone", "python_version", "pip_spec",
+        },
+    }
+
+    def test_only_known_placeholders_appear(self):
+        import re
+        for name, allowed in self.TEMPLATES.items():
+            text = (ROOT / ".claude/skills/tpu-management/mcp" / name).read_text()
+            found = set(re.findall(r"\{([^}]*)\}", text))
+            unexpected = found - allowed
+            self.assertEqual(
+                unexpected, set(),
+                f"{name} has brace groups str.format() will choke on: {unexpected}",
+            )
+
+    def test_every_template_renders(self):
+        """Render each through the real server helper — the render IS the test."""
+        import subprocess
+        for render in (
+            lambda: server._get_formatted_startup_script("google/gemma-4-E2B-it", "europe-west4-a", tp_size=1),
+            lambda: server._get_jax_startup_script("europe-west4-a"),
+            lambda: server._get_cpu_debug_startup_script("europe-west4-a"),
+        ):
+            script = render()
+            proc = subprocess.run(["bash", "-n", "/dev/stdin"], input=script,
+                                  text=True, capture_output=True)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
 
 
 class RepoHygieneTests(unittest.TestCase):
@@ -235,7 +409,8 @@ class RepoHygieneTests(unittest.TestCase):
             "mcp/server.py",
             "SKILL.md",
             "mcp/startup_script_template.sh",
-            "mcp/startup_script_pytorch_template.sh",
+            "mcp/startup_script_jax_template.sh",
+            "mcp/startup_script_cpu_template.sh",
         ):
             self.assertTrue(
                 filecmp.cmp(
