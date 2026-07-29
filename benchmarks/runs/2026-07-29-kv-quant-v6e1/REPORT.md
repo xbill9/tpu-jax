@@ -398,3 +398,111 @@ The last is the one worth keeping: it failed in the flattering direction and not
 raised. Only the step-time column exposed it. **Never accept a capacity number
 without a latency number beside it** — a configuration that fits more and runs
 slower is not a win, and only the pair tells you which you got.
+
+---
+
+# Addendum 3: int8 KV quality, measured; and a roofline cross-check
+
+## int8 KV is quality-neutral, on three independent metrics
+
+Seven greedy prompts agreeing with bf16 was enough to keep working and not enough
+to publish. The cache dtype affects DECODE only — prefill attends over freshly
+computed K/V — so the measurement is teacher-forced through the decode path, on
+public-domain text the model did not generate.
+
+**583 forced decode steps, four passages:**
+
+| dtype | perplexity | vs bf16 | greedy match |
+|---|---:|---:|---:|
+| bf16 | 28.7251 | 1.0000x | 100% |
+| **int8** | **28.4119** | **0.9891x** | **97.08%** |
+| fp8_e4m3 | 29.3620 | 1.0222x | 96.74% |
+| fp8_e5m2 | 28.4074 | 0.9889x | 92.62% |
+
+int8 is within 1.1% of bf16 and slightly below it — quantization noise landing
+favourably, not a real gain. The honest word is *indistinguishable*.
+
+Note that perplexity and greedy match **disagree** about e5m2: it ties int8 on
+averaged likelihood while flipping the argmax more than twice as often. Averaged
+log-likelihood can look fine while the token actually emitted changes. For a
+serving cache, greedy match is the more sensitive instrument.
+
+## Error does not compound with decode depth
+
+**968 continuous forced decode steps, cache never reset**, binned by depth:
+
+| depth | int8 NLL gap | int8 greedy match |
+|---:|---:|---:|
+| 0-161 | +0.0065 | 98.76% |
+| 161-322 | +0.0185 | 99.38% |
+| 322-483 | +0.0280 | 97.52% |
+| 483-644 | +0.0058 | 98.76% |
+| 644-805 | +0.0174 | 98.14% |
+| 805-968 | +0.0049 | **100.00%** |
+
+The gap at token 900 is smaller than at token 100. Each token's K/V is quantized
+independently against its own scale at write time, so there is no feedback path
+for error to grow; teacher forcing removes the only other route (divergence
+through the generated tokens themselves), which isolates the cache cleanly.
+
+e5m2 is the exception: its NLL gap rises to +0.050 and +0.032 in the last two
+bins while its overall perplexity looks fine. It degrades at depth.
+
+*(An earlier version of this measurement binned four concatenated passages into
+quarters. The passages were 164/146/127/146 steps, so the bin boundaries landed
+on passage boundaries and each passage restarted the cache at 32 tokens — it
+measured passage difficulty, not depth. Superseded by the single-run version
+above.)*
+
+## Roofline cross-check: this engine is NOT at the hardware limit
+
+Every throughput figure in this report comes from a wall clock. Second
+instrument: count the bytes a decode step must read (weights once, plus all
+resident KV), divide by the measured time, compare against the published v6e-1
+figure of 1640 GB/s.
+
+| config | measured | roofline | achieved | % of peak |
+|---|---:|---:|---:|---:|
+| bf16 ctx512 B512 | 23.90 ms | 6.98 ms | 479 GB/s | 29% |
+| bf16 ctx512 B1296 | 61.11 ms | 11.49 ms | 308 GB/s | 19% |
+| bf16 ctx8192 B87 | 52.77 ms | 12.05 ms | 374 GB/s | 23% |
+| int8 ctx8192 B32 | 13.16 ms | 5.52 ms | 688 GB/s | **42%** |
+| int8 ctx512 B2432 | 73.83 ms | 11.09 ms | 246 GB/s | **15%** |
+
+**15-42% of peak bandwidth: 2.4x to 6.7x slower than physics allows.** For
+comparison, vLLM's dominant weight-streaming operations have been measured at
+84-91% of bandwidth on v5e.
+
+So the absolute throughput numbers in this report are **not a statement about
+what a v6e-1 can do**. They are what an unoptimized from-scratch reference
+implementation achieves. The likely causes are the W4A16 reference dequant, which
+re-materializes weights every forward, and eager attention rather than a fused
+kernel. There is 2-6x of headroom in the engine, which puts every optimization in
+this report — cache dtype, PLE bits — firmly second-order behind the kernel gap.
+
+Efficiency also *falls* with batch (29% -> 19% as B goes 512 -> 1296): attention
+traffic scales with B x ctx while weights stay fixed, so larger batches are
+increasingly dominated by the part this implementation does least well.
+
+Caveat: 1640 GB/s is a published figure, not measured here. The percentages
+inherit its error; the ratios between configurations do not.
+
+## Where HBM actually goes, and why every prediction over-shot
+
+| config | weights + KV | unaccounted (temporaries) |
+|---|---:|---:|
+| bf16 ctx512 B1296 | 18.85 GB | **13.15 GB (41%)** |
+| bf16 ctx8192 B87 | 19.75 GB | 12.25 GB (38%) |
+| int8 ctx512 B2432 | 18.19 GB | **13.81 GB (43%)** |
+| int8 ctx8192 B172 | 19.71 GB | 12.29 GB (38%) |
+
+Weights and KV never account for more than ~20 GB of the 32. The remaining
+~40% is activation temporaries that grow with batch.
+
+This is the `g(B)` term that appeared throughout this report — in step time, in
+the ctx-512-vs-8192 capacity gap, and in the PLE results — now quantified. It is
+why **"bytes freed / bytes per token" over-predicted every single time**: freed
+space is split between KV and the temporaries that arrive with the extra
+sequences, not handed to KV alone. Every capacity prediction in this project that
+used that division was wrong by roughly the same factor, and this table is the
+reason.
