@@ -175,6 +175,23 @@ python3 ports/gemma4/jax_e_benchmark_sweep_v2.py \
   lattice, which is why a cached fp8 key meeting a bf16 query raises rather than
   promoting — while int8 *is* in the lattice and silently contracts against raw
   integers. See `quantize_kv` in `ports/gemma4/jax_e_model.py`.
+- **[JAX debugging](https://docs.jax.dev/en/latest/debugging.html)** — the tools for
+  the failure mode this codebase keeps producing: things that run, report success,
+  and compute the wrong thing.
+  - `jax_debug_nans` catches NaN at the point of creation instead of many layers
+    downstream. The engine currently asserts `jnp.all(jnp.isfinite(...))` by hand
+    in a few places; this is the supported way.
+  - `jax.experimental.checkify` adds jit-compatible runtime assertions — bounds,
+    NaN, user predicates — which is what a quantized KV cache wants: a scale of
+    zero or an unwritten slot should raise, not silently produce garbage.
+  - `jax.debug.print` / `jax.debug.breakpoint` print from *inside* jit. Worth
+    knowing before hand-rolling probe wrappers, and note that wrapping a Pallas
+    kernel body breaks `pallas_call`'s inspection of it — probe the public entry
+    point instead.
+  - `jax_disable_jit` turns a traced program back into ordinary Python. The fastest
+    route through a `TracerBoolConversionError`, e.g. calling `int()` on a value
+    that came from a params pytree — see the group-size handling in `gather_ple`,
+    which derives its shape statically for exactly this reason.
 
 ### 🔑 Verified Takeaways
 - **QAT checkpoints load.** The pure-JAX path resolves the vLLM TPU loader failure
