@@ -1097,42 +1097,115 @@ def dequantize_params_to_dense(params: Dict[str, Any]) -> Dict[str, Any]:
     return convert(params)
 
 
-def quantize_ple_table(params: Dict[str, jax.Array]) -> Dict[str, jax.Array]:
-    """Replace the per-layer-embedding table with a per-row int8 copy.
+def quantize_ple_table(params: Dict[str, jax.Array], bits: int = 8,
+                       group_size: int = 0) -> Dict[str, jax.Array]:
+    """Replace the per-layer-embedding table with an int8 or int4 copy.
 
     `embed_tokens_per_layer` is [vocab, layers*D_ple] — 4.70 GB in BF16 on E2B,
-    the single largest tensor in the model. It is used exactly ONCE, as a gather
-    (`table[input_ids]`), and never in a matmul, so quantization error cannot
-    compound the way it does for `embed_tokens` (which is also the tied LM head).
-    That makes it the lowest-risk quantization target in the model.
+    the single largest tensor in the model and **72% of resident weights**. The
+    shipped QAT checkpoint leaves it unquantized: W4A16 compressed the 1.06 GB of
+    transformer weights and none of the 5.50 GB of lookup tables.
+
+    It is used exactly ONCE, as a gather (`table[input_ids]`), and never in a
+    matmul, so quantization error cannot compound the way it does for
+    `embed_tokens` (which is also the tied LM head). That makes it the
+    lowest-risk quantization target in the model, and the largest.
 
     This is a MEMORY optimization, not a bandwidth one: a gather reads only the
     rows the prompt touches, so decode never streams the table. The win is HBM
-    headroom -> larger batch.
+    headroom -> more resident KV tokens -> more concurrent sequences.
+
+    bits=8:  per-row scale,   4.70 GB -> 2.35 GB
+    bits=4:  grouped scale,   4.70 GB -> 1.17 GB (two nibbles per byte)
+
+    group_size: 0 means one scale per row. For int4 that is far too coarse — 16
+      levels across all 8960 elements — so pass the per-layer slice width
+      (`hidden_size_per_layer_input`, 256 on E2B), which is also the semantically
+      natural grouping: each layer's slice gets its own scale. Overhead is 35
+      scales x 2 B against 4480 packed bytes, i.e. 1.6%.
 
     Returns a new dict; the original is not mutated. The BF16 table is dropped,
     since nothing else uses it.
     """
+    if bits not in (4, 8):
+        raise ValueError(f"PLE quantization supports 4 or 8 bits, got {bits}")
     tbl = params["embed_tokens_per_layer"]
-    amax = jnp.max(jnp.abs(tbl.astype(jnp.float32)), axis=-1, keepdims=True)
-    scale = jnp.maximum(amax, 1e-8) / 127.0
-    q8 = jnp.clip(jnp.round(tbl.astype(jnp.float32) / scale), -127, 127).astype(jnp.int8)
+    V, LD = tbl.shape
+    g = int(group_size) or LD
+    if LD % g:
+        raise ValueError(f"group_size {g} does not divide row width {LD}")
+    qmax = 127.0 if bits == 8 else 7.0
+
+    # Quantize on the HOST, in row chunks. This is a load-time operation and has
+    # no business competing for accelerator memory: upcasting E2B's 4.70 GB table
+    # to float32 in one shot needs 8.75 GB, which OOMs a v6e-1 that already holds
+    # the rest of the parameters. Chunking bounds the working set to a few hundred
+    # MB, and doing it off-device leaves HBM entirely alone.
+    cpu = jax.devices("cpu")[0]
+    # Where the table came from is where the quantized copy must end up. Leaving
+    # it on the host is catastrophic and silent in the wrong direction: capacity
+    # measurements look BETTER (the table no longer occupies HBM at all) while
+    # every gather crosses the host interconnect. Measured at 18.5 s per decode
+    # step against 60 ms resident — the only symptom, since nothing errors.
+    src_devices = getattr(tbl, "devices", lambda: set())()
+    home = next(iter(src_devices), None)
+    rows_per_chunk = max(1, (1 << 26) // (LD * 4))       # ~256 MB of float32
+    q_chunks, s_chunks = [], []
+    for start in range(0, V, rows_per_chunk):
+        blk = jax.device_put(tbl[start:start + rows_per_chunk], cpu)
+        blk = blk.astype(jnp.float32).reshape(-1, LD // g, g)
+        amax = jnp.max(jnp.abs(blk), axis=-1, keepdims=True)
+        scale = jnp.maximum(amax, 1e-8) / qmax
+        q = jnp.clip(jnp.round(blk / scale), -qmax, qmax).reshape(-1, LD)
+        if bits == 8:
+            q_chunks.append(q.astype(jnp.int8))
+        else:
+            # Two signed nibbles per byte. Bias by +8 into [0, 15] so the shift
+            # and mask are unsigned; `gather_ple` subtracts it back.
+            u = (q + 8.0).astype(jnp.uint8)
+            q_chunks.append((u[:, 0::2] | (u[:, 1::2] << 4)).astype(jnp.uint8))
+        s_chunks.append(scale.astype(jnp.bfloat16))
+
     out = dict(params)
     out.pop("embed_tokens_per_layer")
-    out["embed_tokens_per_layer_q8"] = q8
-    out["embed_tokens_per_layer_scale"] = scale.astype(jnp.bfloat16)
+    key = "embed_tokens_per_layer_q8" if bits == 8 else "embed_tokens_per_layer_q4"
+    q_all = jnp.concatenate(q_chunks, axis=0)
+    s_all = jnp.concatenate(s_chunks, axis=0)
+    if home is not None:
+        q_all = jax.device_put(q_all, home)
+        s_all = jax.device_put(s_all, home)
+    out[key] = q_all
+    out["embed_tokens_per_layer_scale"] = s_all
     return out
 
 
 def gather_ple(params: Dict[str, jax.Array], input_ids: jax.Array) -> jax.Array:
     """Gather per-layer embeddings, from either the BF16 or int8 table."""
     q8 = params.get("embed_tokens_per_layer_q8")
-    if q8 is None:
+    q4 = params.get("embed_tokens_per_layer_q4")
+    if q8 is None and q4 is None:
         return params["embed_tokens_per_layer"][input_ids]
-    # Dequantize only the gathered rows, not the table.
-    rows = q8[input_ids].astype(jnp.bfloat16)
+
+    if q8 is not None:
+        rows = q8[input_ids].astype(jnp.bfloat16)                    # [B, S, LD]
+    else:
+        # Gather the packed bytes, then split nibbles — half the HBM traffic of
+        # gathering an unpacked table, and the unpack touches only the rows the
+        # prompt actually references.
+        packed = q4[input_ids]                                        # [B, S, LD/2]
+        lo = (packed & 0x0F).astype(jnp.int32) - 8
+        hi = (packed >> 4).astype(jnp.int32) - 8
+        rows = jnp.stack([lo, hi], axis=-1).reshape(*packed.shape[:-1], -1)
+        rows = rows.astype(jnp.bfloat16)                              # [B, S, LD]
+
     scale = params["embed_tokens_per_layer_scale"][input_ids].astype(jnp.bfloat16)
-    return rows * scale
+    # scale is [B, S, LD/g, 1]. Derive the group count from its SHAPE rather than
+    # from a stored integer: a Python int inside the params pytree becomes a
+    # traced array under jit, and `int()` on a tracer raises.
+    n_groups = scale.shape[-2]
+    grouped = rows.reshape(*rows.shape[:-1], n_groups, rows.shape[-1] // n_groups)
+    # Regroup rather than repeat, so the scale is never widened to the full row.
+    return (grouped * scale).reshape(*rows.shape)
 
 
 def quantize_lm_head(params: Dict[str, jax.Array], keep_bf16: bool = False) -> Dict[str, jax.Array]:

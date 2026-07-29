@@ -163,6 +163,7 @@ class JaxGemmaEngine:
         w4a16_layout: str = "plane",
         int8_lm_head: bool = False,
         int8_ple: bool = False,
+        ple_bits: int = 0,
         dequant_at_load: bool = False,
         window_kv: bool | None = None,
         donate_cache: bool = False,
@@ -186,7 +187,16 @@ class JaxGemmaEngine:
         # running the dense path is 1.60x faster at B=1 and 1.14x at B=32 — worth it
         # whenever the dense model fits (E2B is 3.7 GiB). Keep it off for models that
         # only fit quantized (31B, 26B MoE), where the trade runs the other way.
-        self.int8_ple = int8_ple
+        # The PLE table is 4.70 GB of E2B's 6.56 GB resident — 72% of the
+        # weights, and the shipped QAT checkpoint leaves it in BF16. It is a
+        # gather, never a matmul, so dequantizing the fetched rows is nearly free
+        # and the saving is pure HBM headroom for KV.
+        #   ple_bits=8 -> 2.35 GB (-2.35),  ple_bits=4 -> 1.19 GB (-3.51)
+        # `int8_ple=True` is the older spelling of ple_bits=8.
+        self.ple_bits = 8 if (int8_ple and not ple_bits) else int(ple_bits)
+        if self.ple_bits not in (0, 4, 8):
+            raise ValueError(f"ple_bits must be 0, 4 or 8; got {self.ple_bits}")
+        self.int8_ple = self.ple_bits == 8
         self.dequant_at_load = dequant_at_load
         # Windowing the sliding layers' KV saves memory once context exceeds the
         # window (2.67x at 8K) but measured ~3% slower on the decode step at short
@@ -265,8 +275,13 @@ class JaxGemmaEngine:
 
         if self.int8_lm_head:
             self.params = quantize_lm_head(self.params)
-        if self.int8_ple:
-            self.params = quantize_ple_table(self.params)
+        if self.ple_bits:
+            # Group by the per-layer slice width: each layer's 256-element slice
+            # gets its own scale. A single row-wide scale is workable at 8 bits
+            # and far too coarse at 4 (16 levels across all 8960 elements).
+            self.params = quantize_ple_table(
+                self.params, bits=self.ple_bits,
+                group_size=self.config.hidden_size_per_layer_input)
         if self.dequant_at_load:
             self.params = dequantize_params_to_dense(self.params)
             self.quant_mode = "fp16"      # weights are dense now
