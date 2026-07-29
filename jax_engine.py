@@ -166,7 +166,7 @@ class JaxGemmaEngine:
         ple_bits: int = 0,
         dequant_at_load: bool = False,
         window_kv: bool | None = None,
-        donate_cache: bool = False,
+        donate_cache: bool = True,
         prefill_chunk_size: int | None = None,
     ):
         self.model_id = model_id
@@ -204,6 +204,21 @@ class JaxGemmaEngine:
         if window_kv is None and max_model_len and getattr(self, "config", None) is None:
             window_kv = None          # resolved at load(), once the config is known
         self.window_kv = window_kv
+        # Buffer donation lets XLA write the updated KV cache into the input
+        # buffer instead of allocating a new one. Without it, `dynamic_update_slice`
+        # writes ONE token by producing a whole new cache array, so every decode
+        # step reads the cache, writes a full copy, then reads it again to attend.
+        #
+        # Measured on v6e-1 at ctx 8192, B=32, 15 samples per point (IQR < 1.3%):
+        #   bf16 cache  21.26 -> 13.14 ms  = 1.62x
+        #   int8 cache  13.54 -> 11.09 ms  = 1.22x
+        # Consistent across every PLE setting, and output is token-identical, so
+        # this is a scheduling change and nothing else. Default ON.
+        #
+        # The cost: donated buffers are INVALIDATED by the call that consumes them.
+        # Anything holding a reference to a cache across steps must re-read it from
+        # the step's return value, never reuse the object it passed in. Set False if
+        # a caller needs the old cache to stay valid.
         self.donate_cache = donate_cache
         # Prefill, not decode, sets the batch ceiling. Measured on v6e-1 by
         # compile-time memory_analysis: prefill temporaries are LINEAR in the total

@@ -506,3 +506,83 @@ space is split between KV and the temporaries that arrive with the extra
 sequences, not handed to KV alone. Every capacity prediction in this project that
 used that division was wrong by roughly the same factor, and this table is the
 reason.
+
+---
+
+# Addendum 4: the KV cache was being copied every step
+
+Independent re-validation, prompted by how counter-intuitive several results
+were. It found a bug underneath most of them.
+
+## The finding
+
+`dynamic_update_slice` writes ONE token into the KV cache. Without buffer
+donation, XLA produces a whole NEW cache array to do it, so every decode step
+reads the cache, writes a full copy, then reads it again to attend — roughly 3x
+the necessary traffic. **Every benchmark in this repo built its own
+`jax.jit(make_cached_decode_step(...))` with no donation**, so every step time
+measured before this addendum was taken on the copying path.
+
+Marginal KV bandwidth, weights cancelled by taking the slope:
+
+| path | marginal | % of calibrated 1417 GB/s |
+|---|---:|---:|
+| copying | 276 GB/s | 19% |
+| **donated** | **794 GB/s** | **56%** |
+| attention kernel in isolation | 547-844 GB/s | 39-59% |
+
+The donated full step matches attention measured alone, which says the eager
+attention kernel was never the main problem. Mask construction costs -0.001 ms,
+i.e. nothing. The profiler corroborates: six `copy.NNNN` operations at ~0.4 ms
+each per step.
+
+## Corrected numbers, 15 samples per point, IQR < 1.3%
+
+One configuration per PROCESS, because the original sweep ran everything
+sequentially in one process with the quantized configs last, leaving HBM
+fragmentation as an uncontrolled confound.
+
+| effect | bf16 cache | int8 cache |
+|---|---:|---:|
+| donation | **1.60-1.62x** | 1.19-1.23x |
+| int8 vs bf16, copying path | — | **1.55-1.58x** |
+| int8 vs bf16, donated path | — | **1.17-1.19x** |
+
+All twelve comparisons flagged REAL against a 2x-IQR threshold, consistent across
+all three PLE settings.
+
+## What this corrects
+
+**"int8 KV is 1.22-1.78x faster" was substantially an artifact.** On the copying
+path int8 halves the bytes of the *copy* as well as the read, so it was being
+credited for mitigating a bug. On a correct implementation the speed advantage is
+**~1.18x**. Donation helps bf16 (1.62x) far more than int8 (1.22x) for the same
+reason: twice the cache to not copy.
+
+**The capacity result is untouched.** 1.88-1.98x more resident KV tokens is a
+memory fact, independent of how the step is scheduled.
+
+**The PLE wash survives.** Under donation: 13.143 / 13.179 / 13.099 ms for
+bf16 / int8 / int4 PLE — a 0.6% spread, inside the noise floor. Quantizing 53% of
+the model still buys capacity and not throughput.
+
+## Best configuration
+
+`ple-4 / kv-int8 / donated`: **11.080 ms, 2,888 tok/s, 3.11 GB of weights**
+against the original baseline's 21.262 ms, 1,505 tok/s, 6.62 GB.
+**1.92x faster at 53% the size**, and donation is the largest single contributor.
+
+Verified token-identical on the real checkpoint across five prompts, so donation
+is a scheduling change and nothing else. Now the engine default
+(`donate_cache=True`), with `tests/test_donation.py` pinning both the parity and
+the aliasing contract — a donated buffer is invalidated by the call that consumes
+it, and code reusing one must fail loudly rather than read a recycled buffer.
+
+## Method note
+
+The reason this went unnoticed for a whole session is that every measurement
+shared the same defect, so every *comparison* stayed internally valid. Ratios
+between configurations were right; the baseline they were measured against was
+wrong. Cross-checking against an absolute physical bound — bytes moved per second
+against calibrated bandwidth — is what exposed it, and no amount of A/B rigor
+would have.
