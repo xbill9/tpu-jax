@@ -211,3 +211,76 @@ tests/test_chunked_prefill.py    #  8 tests: mask, parity, token-exactness
 ```
 
 100 tests pass on CPU; the two suites above also pass on TPU.
+
+---
+
+# Addendum: the 31B on CPU (2026-07-29, overnight)
+
+Validating the two `jax_e_loader` branches the 31B exercises and E2B does not
+(`hidden_size_per_layer_input == 0`, `num_kv_shared_layers == 0`). Run on GCE
+CPU boxes; no TPU involved.
+
+## `attention_k_eq_v`: the 31B ships no `v_proj` on full-attention layers
+
+The load failed with exactly ten missing tensors, all at `i % 6 == 5` — every
+full-attention layer in the 60-layer `[s,s,s,s,s,f]` pattern. Reading the
+checkpoint keys directly: those layers carry `q_proj`, `k_proj`, `k_norm` and
+`o_proj`, and **no `v_proj` at all**. `config.json` sets `attention_k_eq_v: True`.
+V *is* K — one projection feeds both.
+
+E2B sets the flag `False` and ships `v_proj` on all fifteen non-shared layers,
+verified key by key, so the default path is unaffected.
+
+Fixed by aliasing V to K in the loader (the same arrays, not copies), gated on
+`Gemma4EConfig.attention_k_eq_v`. Six tests in `tests/test_attention_k_eq_v.py`
+cover the alias, that the flag *off* still reports the tensor missing, and that a
+real `v_proj` is never clobbered.
+
+The loader's strict validation — added earlier the same day after the E2B
+multimodal-prefix incident produced an all-`None` parameter tree — is what turned
+this into a precise ten-tensor error instead of a silently wrong model.
+
+## Results
+
+| stage | result |
+|---|---|
+| E2B control generation | PASS — `'Paris'`, 6.56 GB of weights |
+| 31B config | PASS — 60 layers, no PLE, no KV sharing, identity share map |
+| 31B load | PASS — 135.7 s, **19.36 GB of weights**, all 60 layers verified |
+| 31B forward (60 layers) | **OOM at 130.5 GB** on a 125 GB host |
+| 31B forward (6 layers) | PASS — prefill 36.9 s, decode ~8.7 s/token, finite logits |
+
+The 19.36 GB measured against 18.98 GB projected from `config.json` is a **2%**
+error, which corroborates the v6e-1 capacity math above: ~13 GB free for KV after
+weights, ~17 concurrent streams at ctx 8192 with an int8 cache.
+
+The truncated run keeps the first six layers — the smallest prefix containing a
+full-attention layer — so it exercises both attention geometries (sliding: 16 KV
+heads x 256; full: 4 x 512), the K/V alias, the no-PLE branch and the degenerate
+share map. Asserted on the real weights: `layer_5` V *is* `layer_5` K, `layer_0`
+V is independent.
+
+## Host memory, measured
+
+| workload | peak RSS |
+|---|---:|
+| E2B, load + generation | 26 GB |
+| 31B, load only | 48 GB |
+| 31B, load + 60-layer forward | >130 GB |
+
+XLA:CPU allocates roughly 2x the weight bytes to load and far more to run: the
+reference W4A16 path dequantizes each packed weight to dense bf16 inside the
+forward, and the CPU backend keeps those temporaries alive across layers. On TPU
+the dequant fuses into the matmul (`multiply_reduce_fusion`), which is why the
+same model serves from 32 GB of HBM.
+
+**Practical sizing: 32 GiB for E2B, 64 GiB to load and inspect a 31B, and more
+than 128 GiB to run one unfused on CPU** — or truncate the layer count, which
+tests the same code paths for a tenth of the memory.
+
+## Cost note
+
+The first box was Spot and was preempted mid-run, taking the 23 GB checkpoint
+download with it. Standard provisioning plus an in-place machine-type resize
+(which preserves the boot disk, and therefore the download) was the cheaper path
+overall despite the higher hourly rate.

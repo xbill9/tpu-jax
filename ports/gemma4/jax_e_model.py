@@ -65,6 +65,12 @@ class Gemma4EConfig:
     # final_logit_softcapping but no attn_logit_softcapping. Softcapping the scores
     # saturates tanh and destroys the attention distribution.
     attn_logit_softcapping: float = 0.0
+    # attention_k_eq_v: V is K — one projection feeds both, and the checkpoint
+    # ships no v_proj on the affected layers. True on gemma-4-31B (its 10
+    # full-attention layers have k_proj/k_norm and no v_proj at all); False on
+    # E2B, which ships v_proj everywhere. The loader aliases V to K when set;
+    # the cache still stores both, which is redundant but correct.
+    attention_k_eq_v: bool = False
     num_kv_shared_layers: int = 20
     sliding_window: Optional[int] = None
     use_double_wide_mlp: bool = True

@@ -77,10 +77,23 @@ JAX_PYTHON_VERSION = os.getenv("JAX_PYTHON_VERSION", "3.13")
 # passes -f for it. Pin here (e.g. "jax[tpu]==0.11.0") for reproducible runs.
 JAX_PIP_SPEC = os.getenv("JAX_PIP_SPEC", "jax[tpu]")
 # Best-effort extras installed after the TPU stack; failure is non-fatal.
-# CPU debug boxes: correctness work off the TPU. Memory is the spec that matters —
-# 31B at W4A16 is ~16 GiB of weights, so 32 GiB of host RAM is the useful floor;
-# e2-highmem-4 is the cheapest tier that clears it (8 GiB per vCPU, no wasted cores).
-CPU_DEBUG_MACHINE_TYPE = os.getenv("CPU_DEBUG_MACHINE_TYPE", "e2-highmem-4")
+# CPU debug boxes: correctness work off the TPU. Memory decides what you can do,
+# vCPUs decide how long you wait. These figures are MEASURED peak RSS, not derived
+# from weight sizes — XLA:CPU allocates far more than the parameters occupy:
+#
+#   E2B  load + short generation   26 GiB peak   (6.6 GiB of weights)
+#   31B  load only                 48 GiB peak   (19 GiB of weights)
+#   31B  load + one forward pass   >64 GiB       (OOM-killed on a 64 GiB box)
+#
+# So the useful tiers are 64 GiB to inspect a 31B parameter tree and 128 GiB to
+# actually run it. 32 GiB only covers E2B. Guessing from checkpoint size
+# underestimates this by roughly 2x; do not.
+#
+# e2-highmem-16 (16 vCPU / 128 GiB) is the default because it is the cheapest SKU
+# that runs a 31B forward pass, and CPU passes on a 31B are slow enough that the
+# cores matter. Prefer Spot for short sessions, but note a preemption takes the
+# checkpoint download with it — a 23 GB re-fetch.
+CPU_DEBUG_MACHINE_TYPE = os.getenv("CPU_DEBUG_MACHINE_TYPE", "e2-highmem-16")
 CPU_DEBUG_PIP_SPEC = os.getenv(
     "CPU_DEBUG_PIP_SPEC",
     "jax numpy scipy ml_dtypes safetensors huggingface_hub transformers",
@@ -991,11 +1004,12 @@ async def create_cpu_debug_vm(
     zone: Optional[str] = None,
     machine_type: Annotated[
         str,
-        Field(description="GCE machine type; memory is what matters. e2-highmem-4 = 4 vCPU/32 GiB"),
+        Field(description="GCE machine type. Memory gates what loads, vCPUs gate how long you wait. "
+                          "e2-highmem-16 = 16 vCPU/128 GiB runs a 31B; 64 GiB only loads one; 32 GiB is E2B only"),
     ] = CPU_DEBUG_MACHINE_TYPE,
     boot_disk_size_gb: Annotated[
-        int, Field(ge=50, description="Checkpoints are large: E2B ~8 GB, 31B W4A16 ~16-20 GB, MoE ~14 GB")
-    ] = 250,
+        int, Field(ge=50, description="Checkpoints are large: E2B 8.3 GB, 31B W4A16 23.3 GB, MoE ~14 GB")
+    ] = 100,
     spot: Annotated[
         bool, Field(description="Spot is ~70% cheaper and preemption is harmless for a debug box")
     ] = True,
@@ -1013,7 +1027,12 @@ async def create_cpu_debug_vm(
 
     Memory is the spec that decides what you can debug:
       * ~8 GiB  — E2B/E4B dense
-      * ~32 GiB — 31B and 26B MoE at W4A16 (~16 GiB and ~13.6 GiB of weights)
+      * ~32 GiB — E2B only (26 GiB measured peak for load + short generation).
+      * ~64 GiB — enough to LOAD the 31B and inspect its parameter tree
+                  (48 GiB measured peak), but a forward pass OOMs.
+      * ~128 GiB — enough to RUN the 31B on CPU.
+    These are measured peak RSS. XLA:CPU allocates roughly 2x what the weights
+    occupy, so sizing from checkpoint bytes will leave you short.
     Host RAM does NOT predict HBM: XLA:CPU allocates differently and can use
     virtual memory, so a model that loads here may still OOM on a v6e-1.
 
@@ -2070,7 +2089,7 @@ async def get_help() -> str:
         f"- **`JAX_PIP_EXTRAS`**: best-effort extras installed after the TPU stack (non-fatal).\n"
         f"  - *Current Value:* `{JAX_PIP_EXTRAS}`\n"
         f"- **`CPU_DEBUG_MACHINE_TYPE`**: machine type for `create_cpu_debug_vm`. Memory is the "
-        "spec that matters — 32 GiB covers 31B/26B-MoE at W4A16.\n"
+        "spec that matters — 128 GiB to run a 31B on CPU, 64 GiB to only load it.\n"
         f"  - *Current Value:* `{CPU_DEBUG_MACHINE_TYPE}`\n"
         f"- **`CPU_DEBUG_PIP_SPEC`**: packages installed on CPU debug boxes (no libtpu).\n"
         f"  - *Current Value:* `{CPU_DEBUG_PIP_SPEC}`\n"
@@ -2085,7 +2104,7 @@ async def get_help() -> str:
         "- **`find_tpu_vm`**: Sweeps zones attempting flex-start creation until one grants capacity "
         "(same workload choice).\n"
         "- **`wait_for_vllm_ready`**: Polls health endpoint + serial marker until serving is up (~10 min loads).\n"
-        "- **`create_cpu_debug_vm`**: Plain CPU VM (default Spot e2-highmem-4/32 GiB) running the "
+        "- **`create_cpu_debug_vm`**: Plain CPU VM (default Spot e2-highmem-16/128 GiB) running the "
         "same JAX stack minus libtpu — correctness work off the TPU, for cents an hour.\n"
         "- **`wait_for_jax_ready`**: Polls the serial marker until the JAX environment is ready (or failed).\n"
         "- **`verify_jax_tpu`**: Re-runs the JAX device check over SSH (asserts jax.devices() sees a TPU).\n"

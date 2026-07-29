@@ -150,20 +150,51 @@ global one is the exact tensor #3225 reports as unimplemented in vLLM's TPU load
 | `tie_word_embeddings` | true | `lm_head.weight` is a materialized copy |
 | `layer_types` | explicit list | full attention at 4, 9, 14 … (`i % 5 == 4`) |
 
-## 12. Unresolved ⚠️
+## 12. `attention_k_eq_v`: V *is* K, and the checkpoint omits `v_proj` ✅
+
+Set `True` on **gemma-4-31B**, `False` on E2B. Where it is set, the affected layers
+ship no `v_proj` at all — one projection feeds both K and V.
+
+Verified by reading the 31B checkpoint on a CPU box: all ten **full-attention**
+layers (`i % 6 == 5` in its 60-layer `[s,s,s,s,s,f]` pattern) carry `q_proj`,
+`k_proj`, `k_norm`, `o_proj` and **no `v_proj`**, while every sliding layer carries
+both. Shapes at layer 5 confirm the geometry — `k_proj` is `[2048, 672]` packed,
+i.e. `num_global_key_value_heads` (4) × `global_head_dim` (512), and `k_norm` is
+`[512]`.
+
+Loading the 31B without handling this yields exactly ten missing tensors and, in a
+loader that tolerates `None`, a silently broken model. `jax_e_loader` aliases V to
+K (the same arrays, not copies) when `Gemma4EConfig.attention_k_eq_v` is set.
+
+The KV cache still stores K and V separately, which is redundant but correct.
+Collapsing it would save one of the two planes on those layers — worth ~4.5% of the
+31B's KV, since sliding layers dominate its budget.
+
+**This does not explain E2B's KV-bytes discrepancy below.** E2B sets the flag
+`False` and ships `v_proj` on all fifteen non-shared layers, checked key by key.
+
+## 13. `use_bidirectional_attention` is a vision setting ✅
+
+`"vision"` on the 31B, absent/`null` on E2B. It selects bidirectional attention for
+image tokens; text decoding is unaffected, so the causal-only text path is correct
+for both. `store_full_length_kv` is **not present in either config** — it is a
+reference-implementation concept, not a checkpoint field.
+
+## 14. Unresolved ⚠️
 
 - **KV bytes/token.** Our config yields 18.0 KiB; the measured vLLM allocator reports
   15.0 KiB (= 15 layers × 1 head × 256 dim × (K+V) × 2 B). The gap is the three
   full-attention layers, which we give a 512-dim KV head via `global_head_dim`. The
   measurement implies KV is uniformly 256-dim and that 512 is the *query* head dim
   there. Memory estimates are ~20% pessimistic until resolved.
-- **`store_full_length_kv`.** The reference marks the last non-shared layer of each
-  type as storing full-length KV. Our windowed-KV ring windows every sliding layer
-  including the source. Self-consistent (windowed and full-length outputs match in
-  `tests/test_windowed_kv.py`), but whether it matches Gemma's intent for shared
+  *(`attention_k_eq_v` would have explained this neatly — a shared K/V plane on the
+  three full-attention layers gives exactly 15.0 KiB — but E2B sets it `False` and
+  does ship `v_proj`. Ruled out; the gap stands.)*
+- **`store_full_length_kv` behaviour.** The reference marks the last non-shared layer
+  of each type as storing full-length KV. Our windowed-KV ring windows every sliding
+  layer including the source. Self-consistent (windowed and full-length outputs match
+  in `tests/test_windowed_kv.py`), but whether it matches Gemma's intent for shared
   sliding layers is unverified.
-- **`attention_k_eq_v`** (`False`) and **`use_bidirectional_attention`** (`null`) —
-  present in config, effect not traced.
 
 ## How to check the next one
 

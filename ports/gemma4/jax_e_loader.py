@@ -38,6 +38,7 @@ def convert_safetensors_to_jax_params(
     num_layers: int = 35,
     first_kv_shared_idx: int = 15,
     prefix: str = None,
+    attention_k_eq_v: bool = False,
 ) -> Dict[str, Any]:
     """Converts a dict of safetensors numpy/jax arrays into Gemma4EModelJAX parameter PyTree.
 
@@ -47,6 +48,10 @@ def convert_safetensors_to_jax_params(
       - Shared layers (15..34) with q/o attention projections (no k/v)
       - MatFormer Double-Wide MLP weights
       - QAT packed W4A16 weights and scales (_packed, _scale suffix mapping)
+      - attention_k_eq_v: layers that ship k_proj but no v_proj, because V is K
+
+    attention_k_eq_v: set from the checkpoint config. True on gemma-4-31B, where
+      the full-attention layers omit v_proj entirely; False on E2B.
     """
     if prefix is None:
         prefix = detect_text_prefix(raw_weights)
@@ -155,6 +160,24 @@ def convert_safetensors_to_jax_params(
                     dense_key = f"{proj_prefix}.{proj}.weight"
                     if dense_key in raw_weights:
                         attn_p[proj] = get_linear(dense_key)
+
+            # attention_k_eq_v: the checkpoint ships no v_proj on these layers
+            # because V *is* K — one projection feeds both. Verified on
+            # gemma-4-31B, where every full-attention layer (i % 6 == 5) has
+            # k_proj and k_norm but no v_proj at all, while sliding layers carry
+            # both. E2B sets the flag False and ships v_proj everywhere.
+            #
+            # Aliasing rather than copying: these are the same arrays, so the
+            # duplicate reference costs nothing. Storing K and V separately in
+            # the cache is then redundant but correct; collapsing that is a
+            # memory optimization for later, worth ~4.5% of the 31B's KV.
+            if attention_k_eq_v and attn_p.get("v_proj") is None \
+                    and "v_proj_packed" not in attn_p:
+                if "k_proj_packed" in attn_p:
+                    attn_p["v_proj_packed"] = attn_p["k_proj_packed"]
+                    attn_p["v_proj_scale"] = attn_p["k_proj_scale"]
+                elif attn_p.get("k_proj") is not None:
+                    attn_p["v_proj"] = attn_p["k_proj"]
 
             if f"{lp}.self_attn.k_norm.weight" in raw_weights:
                 attn_p["k_norm"] = get_arr(f"{lp}.self_attn.k_norm.weight")

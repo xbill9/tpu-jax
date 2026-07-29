@@ -80,8 +80,15 @@ PYEOF
 
 MEM=$(free -g | grep '^Mem:' | tr -s ' ' | cut -d' ' -f2)
 echo "host memory: $MEM GiB"
-echo "  E2B needs ~6.5 GB packed / ~3.7 GB dense"
-echo "  31B W4A16 needs ~16 GB; 26B MoE ~13.6 GB"
+# Measured, not estimated. `load()` holds every tensor of every shard — vision and
+# audio towers included — before conversion, and the parameter tree then aliases
+# those arrays, so peak RSS tracks the whole checkpoint rather than the text
+# weights alone. Add a few GB of XLA:CPU temporaries on top for a forward pass.
+echo "  E2B  load + generation : 26 GiB measured peak (6.6 GiB of weights)"
+echo "  31B  load only         : 48 GiB measured peak (19 GiB of weights)"
+echo "  31B  load + forward    : >64 GiB — OOM-killed on a 64 GiB host"
+echo "  26B MoE                : not measured (gated repo)"
+echo "  -> 128 GiB to run a 31B, 64 GiB to only load one, 32 GiB for E2B"
 
 $PY -m pip list 2>/dev/null | grep -iE "^(jax|jaxlib|numpy|scipy|ml.dtypes|safetensors|transformers|huggingface) " || true
 

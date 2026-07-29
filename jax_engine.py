@@ -11,6 +11,7 @@ Used by ``jax_openai_server.py``.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 from collections.abc import Iterator, Sequence
@@ -54,6 +55,28 @@ _CACHE_DTYPES = {
     # the other two match bf16. Kept for comparison; do not serve with it.
     "fp8_e5m2": jnp.float8_e5m2,
 }
+
+
+logger = logging.getLogger(__name__)
+
+# Substrings identifying weights that belong to a multimodal tower rather than the
+# text decoder. Matched on a substring rather than a prefix because exports vary in
+# whether they nest under `model.` — E2B ships `model.vision_tower.*` while other
+# revisions use a bare `vision_tower.*`.
+_NON_TEXT_MARKERS = (
+    "vision_tower",
+    "audio_tower",
+    "vision_model",
+    "audio_model",
+    "multi_modal_projector",
+    "embed_vision",
+    "embed_audio",
+)
+
+
+def _is_non_text_tensor(key: str) -> bool:
+    """True for tensors the text decoder never reads."""
+    return any(marker in key for marker in _NON_TEXT_MARKERS)
 
 
 def resolve_cache_dtype(name: str):
@@ -121,6 +144,7 @@ def config_from_hf(hf_config: dict[str, Any]) -> Gemma4EConfig:
         layer_types=pick("layer_types", default=None),
         sliding_window=pick("sliding_window", default=None),
         attn_logit_softcapping=pick("attn_logit_softcapping", default=0.0) or 0.0,
+        attention_k_eq_v=bool(pick("attention_k_eq_v", default=False)),
     )
     return cfg
 
@@ -212,13 +236,31 @@ class JaxGemmaEngine:
         shards = sorted(f for f in os.listdir(path) if f.endswith(".safetensors"))
         if not shards:
             raise FileNotFoundError(f"No .safetensors found in {path}")
+        # Drop the non-text towers as each shard lands rather than after the whole
+        # checkpoint is resident. These checkpoints are multimodal — E2B carries
+        # 0.95 GB of vision/audio the text decoder never reads, and the 31B carries
+        # proportionally more — and `raw` is held for the entire conversion because
+        # the parameter tree aliases its arrays. Filtering here is the difference
+        # between peak RSS tracking the text weights and tracking the whole file.
+        skipped_bytes = 0
         for shard in shards:
-            raw.update(load_file(os.path.join(path, shard)))
+            part = load_file(os.path.join(path, shard))
+            for key, arr in part.items():
+                if _is_non_text_tensor(key):
+                    skipped_bytes += arr.size * arr.dtype.itemsize
+                    continue
+                raw[key] = arr
+            part.clear()
+            del part
+        if skipped_bytes:
+            logger.info("skipped %.2f GB of non-text tower weights",
+                        skipped_bytes / 1e9)
 
         self.params = convert_safetensors_to_jax_params(
             raw,
             num_layers=self.config.num_hidden_layers,
             first_kv_shared_idx=self.config.first_kv_shared_layer_idx,
+            attention_k_eq_v=self.config.attention_k_eq_v,
         )
 
         if self.int8_lm_head:
