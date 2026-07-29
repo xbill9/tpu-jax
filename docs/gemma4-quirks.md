@@ -180,16 +180,32 @@ image tokens; text decoding is unaffected, so the causal-only text path is corre
 for both. `store_full_length_kv` is **not present in either config** — it is a
 reference-implementation concept, not a checkpoint field.
 
-## 14. Unresolved ⚠️
+## 14. KV is 18.0 KiB/token, and full-attention layers really are 512-dim ✅
 
-- **KV bytes/token.** Our config yields 18.0 KiB; the measured vLLM allocator reports
-  15.0 KiB (= 15 layers × 1 head × 256 dim × (K+V) × 2 B). The gap is the three
-  full-attention layers, which we give a 512-dim KV head via `global_head_dim`. The
-  measurement implies KV is uniformly 256-dim and that 512 is the *query* head dim
-  there. Memory estimates are ~20% pessimistic until resolved.
-  *(`attention_k_eq_v` would have explained this neatly — a shared K/V plane on the
-  three full-attention layers gives exactly 15.0 KiB — but E2B sets it `False` and
-  does ship `v_proj`. Ruled out; the gap stands.)*
+Settled by reading the checkpoint. The three full-attention layers among the fifteen
+that own KV (`i % 5 == 4`, so L4/L9/L14) carry a **512-wide** K projection, and their
+`k_norm` is `[512]` to match:
+
+| layer type | count | `k_proj` out | `k_norm` | KV head dim |
+|---|---:|---:|---:|---:|
+| `sliding_attention` | 12 | 256 | `[256]` | 256 |
+| `full_attention` | 3 | **512** | **`[512]`** | **512** |
+
+So `global_head_dim` is the KV head dim on those layers, not merely the query head
+dim. `init_kv_cache` allocates **18.00 KiB/token** at every context length, matching
+`12 × 1 × 256 × 2 + 3 × 1 × 512 × 2 = 9,216` elements × 2 B exactly.
+
+An earlier note recorded a 15.0 KiB/token reading and concluded our estimates were
+"~20% pessimistic". That was backwards. 15.0 KiB is precisely what a **uniform
+256-dim** assumption produces (`15 × 1 × 256 × 2 × 2 B`), and the checkpoint
+contradicts it. Our figure is the correct one; nothing needs adjusting.
+
+Worth checking upstream: an allocator that sizes E2B's KV uniformly at `head_dim`
+would under-provision the three full-attention layers by half. The provenance of
+that 15.0 KiB reading is not recorded here, so this is a lead rather than a report.
+
+## 15. Unresolved ⚠️
+
 - **`store_full_length_kv` behaviour.** The reference marks the last non-shared layer
   of each type as storing full-length KV. Our windowed-KV ring windows every sliding
   layer including the source. Self-consistent (windowed and full-length outputs match

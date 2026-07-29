@@ -10,26 +10,38 @@ this repo tried was aimed at the wrong one.
 
 | budget | governs | measured |
 |---|---|---|
-| resident KV tokens | decode / concurrency | **524,288** bf16 · **1,048,576** int8 |
-| prompt tokens per prefill pass | batch admission | **~11,900** (~2.13 MB/token) |
+| resident KV tokens | decode / concurrency | **663,552-712,704** bf16 · **1,245,184-1,540,096** int8 |
+| prompt tokens per prefill pass | batch admission | **B x chunk <= 8,192** |
 
-Both are flat constants. Neither is a batch size.
+Neither is a batch size.
+
+> **Corrected 2026-07-29 (later session).** An earlier version of this report gave
+> the decode budget as a flat 524,288 tokens with "0.0% spread across four context
+> lengths", and int8 KV as "exactly 2.00x". Both were artifacts of the measurement
+> grid: every ladder was built from the same power-of-two skeleton, so the last
+> passing rung landed on a common product by construction. Re-measured by bisection
+> to 2%, the ceiling is 663,552-712,704 and varies ~7% with context, and int8 KV
+> gives 1.88-1.98x. The conclusions are unchanged; the precision was manufactured.
+> Lesson retained in the methods section: a result that lands exactly on a round
+> number should be suspected of coming from the sampling grid.
 
 ## 1. The decode budget is a constant, to 0.0%
 
 Max batch at each context, then the product:
 
-| ctx | bf16 max B | KV tokens | int8 max B | KV tokens | e4m3 KV tokens |
-|---:|---:|---:|---:|---:|---:|
-| 512 | 1024 | 524,288 | 2048 | 1,048,576 | 1,048,576 |
-| 2,048 | 256 | 524,288 | 512 | 1,048,576 | 1,048,576 |
-| 8,192 | 64 | 524,288 | 128 | 1,048,576 | 1,048,576 |
-| 32,768 | 16 | 524,288 | 32 | 1,048,576 | 1,048,576 |
-| | | **spread 0.0%** | | **spread 0.0%** | **spread 0.0%** |
+Bisected to 2%. (The doubling-ladder figures this table previously carried are
+superseded; see the correction note above.)
 
-Context varies 64x and batch varies 64x; the product does not move. The chip is a
-fixed KV-token budget you may slice any way you like — 1024 chat sessions or 16
-novel-length contexts, same silicon.
+| ctx | bf16 max B | KV tokens | int8 max B | KV tokens | int8 gain |
+|---:|---:|---:|---:|---:|:---:|
+| 512 | 1296 | 663,552 | 2432 | 1,245,184 | 1.88x |
+| 8,192 | 87 | 712,704 | 172 | 1,409,024 | 1.98x |
+
+The chip is best described as a KV-token budget rather than a batch size — roughly
+0.7M tokens at bf16, 1.3M at int8, sliceable as many short sessions or few long
+ones. It is not a *constant*: reaching the budget at short context needs B=1296
+against B=87, and per-sequence non-KV overhead scales with B, so high-batch
+configurations give some back. That is the same `g(B)` term visible in step time.
 
 Decode step time follows the same variable. Grouped by ctx x B rather than by
 either alone:
@@ -284,3 +296,105 @@ The first box was Spot and was preempted mid-run, taking the 23 GB checkpoint
 download with it. Standard provisioning plus an in-place machine-type resize
 (which preserves the boot disk, and therefore the download) was the cheaper path
 overall despite the higher hourly rate.
+
+---
+
+# Addendum 2: the PLE table, and KV bytes/token settled
+
+## The QAT checkpoint quantized 16% of the model
+
+Read off the shipped weights, E2B:
+
+| component | resident | quantized by QAT? |
+|---|---:|:---:|
+| **PLE table** `embed_tokens_per_layer` `[262144, 8960]` BF16 | **4.698 GB** | no |
+| token embedding (tied -> lm_head) | 0.805 GB | no |
+| MLP (int4 packed) | 0.876 GB | yes |
+| attention (int4 packed) | 0.157 GB | yes |
+| PLE projections (int4 packed) | 0.023 GB | yes |
+| **total** | **6.56 GB** | |
+
+W4A16 compressed **1.06 GB** and left **5.50 GB of lookup tables** in BF16. The PLE
+table alone is 72% of resident weights — the largest tensor in the model, and
+untouched by the quantization the checkpoint is named for.
+
+## Quantizing it is free, and buys nothing
+
+`quantize_ple_table(bits=4|8)` with scales grouped per layer slice (256 elements;
+a single row-wide scale is 16 levels across all 8,960 at 4 bits).
+
+| PLE | cache | ctx | max B | step ms | agg tok/s | vs BF16 PLE |
+|---|---|---:|---:|---:|---:|---:|
+| bf16 | bf16 | 512 | 1296 | 60.82 | 21,309 | — |
+| int8 | bf16 | 512 | 1408 | 65.48 | 21,502 | +0.9% |
+| int4 | bf16 | 512 | 1456 | 68.57 | 21,234 | -0.4% |
+| bf16 | bf16 | 8192 | 87 | 52.24 | 1,665 | — |
+| int8 | bf16 | 8192 | 95 | 57.00 | 1,667 | +0.1% |
+| int4 | bf16 | 8192 | 99 | 60.63 | 1,633 | -1.9% |
+| bf16 | int8 | 512 | 2432 | 73.77 | 32,968 | — |
+| int8 | int8 | 512 | 2656 | 78.13 | **33,996** | +3.1% |
+| int4 | int8 | 512 | 2752 | 82.55 | 33,337 | +1.1% |
+| bf16 | int8 | 8192 | 172 | 58.01 | 2,965 | — |
+| int8 | int8 | 8192 | 188 | 64.09 | 2,933 | -1.1% |
+
+Mean across all comparisons: **+0.26%**. Weights fall 6.56 -> 4.23 -> 3.05 GB, a 53%
+cut, and aggregate throughput does not move. Capacity rises 9-13%; step time rises
+6-13%; they cancel.
+
+**Why**: a gather never streams through HBM. The PLE table costs residency, not
+bandwidth, so shrinking it frees space rather than time — and the freed space goes
+to more concurrent sequences, each paying the dequant on every step.
+
+This sharpens the roofline rule rather than contradicting it: **quantization pays
+only on tensors that actually cross the memory bus.** A 4.7 GB table read by gather
+is invisible to the roofline.
+
+## Quality: int4 is free
+
+Real checkpoint, greedy, seven prompts. All correct at every bit width.
+
+| prompt | bf16 (6.56 GB) | int8 (4.23 GB) | int4 (3.05 GB) |
+|---|---|---|---|
+| `What is 2+2?` | `4` | `4` | `4` |
+| `The capital of France is` | `Paris` | `Paris` | `Paris` |
+| first five primes | 2, 3, 5, 7, 11 | 2, 3, 5, 7, 11 | 2, 3, 5, 7, 11 |
+| `'good morning'` in Spanish | `Buenos días.` | `Buenos días.` | `Buenos días.` |
+| haiku | identical | identical | identical |
+| gravity | "drawn toward each other" | same | "exert a pull on each other" |
+| three colours | prepends a self-introduction | same | answers directly |
+
+The 7% synthetic round-trip error at int4 does not degrade trained weights. At B=1,
+int4 is also *faster* than int8 (112 vs 98 tok/s) because the gather reads half the
+bytes and the packing wins back more than the nibble unpack costs.
+
+**Recommendation: quantize the PLE when capacity-bound, never when throughput-bound.
+Not defaulted, for that reason.**
+
+## KV is 18.0 KiB/token, and an earlier note had it backwards
+
+The three full-attention layers among the fifteen that own KV carry a **512-wide** K
+projection with a matching `k_norm` `[512]`; the twelve sliding layers are 256.
+`init_kv_cache` allocates **18.00 KiB/token** at every context length, matching
+`12 x 1 x 256 x 2 + 3 x 1 x 512 x 2 = 9,216` elements x 2 B exactly.
+
+A previous note recorded 15.0 KiB/token and concluded our estimates were "~20%
+pessimistic". Backwards: 15.0 KiB is exactly what a **uniform 256-dim** assumption
+yields, and the checkpoint contradicts it. Our figure is correct.
+
+An allocator that sizes E2B's KV uniformly at `head_dim` would under-provision the
+three full-attention layers by half. The provenance of the 15.0 KiB reading is not
+recorded, so this is a lead, not a report.
+
+## Measurement bugs found in this session, all mine
+
+| bug | failure mode | caught by |
+|---|---|---|
+| doubling ladder too coarse | reports real gains as "no change"; manufactured the fake 0.0% spread | arithmetic — the predicted gain fell between rungs |
+| shared `base` params | charges quantized configs the headroom being measured | reading the harness |
+| PLE quantization OOM on-chip | 8.75 GB upcast with 7.58 GB free | it raised |
+| **quantized table left on host** | **capacity looks BETTER; gathers cross PCIe** | **18,482 ms step time** |
+
+The last is the one worth keeping: it failed in the flattering direction and nothing
+raised. Only the step-time column exposed it. **Never accept a capacity number
+without a latency number beside it** — a configuration that fits more and runs
+slower is not a win, and only the pair tells you which you got.
