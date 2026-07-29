@@ -536,7 +536,7 @@ attention kernel was never the main problem. Mask construction costs -0.001 ms,
 i.e. nothing. The profiler corroborates: six `copy.NNNN` operations at ~0.4 ms
 each per step.
 
-## Corrected numbers, 15 samples per point, IQR < 1.3%
+## Corrected numbers, 15 samples per point, IQR <= 1.32%
 
 One configuration per PROCESS, because the original sweep ran everything
 sequentially in one process with the quantized configs last, leaving HBM
@@ -570,7 +570,8 @@ the model still buys capacity and not throughput.
 
 `ple-4 / kv-int8 / donated`: **11.080 ms, 2,888 tok/s, 3.11 GB of weights**
 against the original baseline's 21.262 ms, 1,505 tok/s, 6.62 GB.
-**1.92x faster at 53% the size**, and donation is the largest single contributor.
+**1.92x faster at 47% of the original weight footprint** (6.618 -> 3.113 GB, a
+53% reduction), and donation is the largest single contributor.
 
 Verified token-identical on the real checkpoint across five prompts, so donation
 is a scheduling change and nothing else. Now the engine default

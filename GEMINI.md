@@ -175,6 +175,18 @@ python3 ports/gemma4/jax_e_benchmark_sweep_v2.py \
   lattice, which is why a cached fp8 key meeting a bf16 query raises rather than
   promoting — while int8 *is* in the lattice and silently contracts against raw
   integers. See `quantize_kv` in `ports/gemma4/jax_e_model.py`.
+- **[How to think in JAX](https://docs.jax.dev/en/latest/notebooks/thinking_in_jax.html)**
+  — start here. Two of its core lessons produced the largest bugs in this engine:
+  - **JAX arrays are immutable**, so an "in-place" update is really a new array.
+    `dynamic_update_slice` writing ONE token into the KV cache therefore rebuilt
+    the whole cache every decode step, which cost 1.62x until buffer donation was
+    enabled. The immutability is the language; donation is the escape hatch.
+  - **Static vs traced values.** A Python `int` stored in a params pytree becomes a
+    tracer under `jit`, and `int()` on a tracer raises. `gather_ple` derives its
+    group count from an array SHAPE rather than a stored integer for this reason.
+  Also covers why `print` inside `jit` shows a tracer, and why dynamic shapes
+  (boolean indexing) will not compile — which is why every cache and mask in this
+  engine is statically shaped and padded to a bucket.
 - **[JAX debugging](https://docs.jax.dev/en/latest/debugging.html)** — the tools for
   the failure mode this codebase keeps producing: things that run, report success,
   and compute the wrong thing.

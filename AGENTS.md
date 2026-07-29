@@ -123,38 +123,87 @@ This workspace includes a high-performance, raw JAX inference engine for **Gemma
 4. **OpenAI-Compatible SSE Token Streaming**:
    - Real-time `text/event-stream` token generation supported via `jax_openai_server.py`.
 
-### 📈 Performance Status: RETRACTED, RE-MEASUREMENT REQUIRED
+### 📈 Performance Status: RE-MEASURED 2026-07-29
 
-The previously published sweep (peak 6,496.8 tok/s; "~2.7x per-user speedup") is
-**withdrawn**. It came from `ports/gemma4/jax_e_benchmark_sweep.py`, which had three
-methodology defects:
+The 2026-07-21 sweep (peak 6,496.8 tok/s) was withdrawn — `jax_e_benchmark_sweep.py`
+timed prefill un-jitted, divided a scan total that contained the prefill by the step
+count, and ran a decode loop with no KV cache and no attention mask. Use
+`ports/gemma4/jax_e_benchmark_sweep_v2.py`, which times jitted prefill and
+steady-state cached decode separately.
 
-1. **Prefill was timed un-jitted**, measuring op dispatch rather than compute. Tell:
-   a 512x context increase (8 -> 4,096 tokens) moved "prefill" only 1.43x (544 ms ->
-   779 ms). That 544 ms also exceeded the entire jitted generate call (~305 ms) which
-   contained a prefill *plus* 15 decode steps.
-2. **"Decode step latency" was `total_scan_time / 16`**, with the prefill inside that
-   total — which is why per-step cost drifted with context length.
-3. **The decode loop had no KV cache and no attention mask.** Each step ran the model
-   on a single token with no history, so it was not autoregressive decoding.
+Re-measured on a v6e-1. Full data in
+`benchmarks/runs/2026-07-29-kv-quant-v6e1/REPORT.md`:
 
-The B=1 row is additionally self-inconsistent: reconstructed wall time is 304.6 ms for
-one sequence vs 109.1 ms for two — the smaller batch 2.8x slower in absolute terms. MXU
-underutilization predicts roughly equal wall time (~2x aggregate, flat per-user), never
-that.
+| | measured |
+|---|---|
+| decode budget | **663,552–712,704** resident KV tokens (bf16) · **1.25–1.54M** (int8) |
+| prefill admission | **B × chunk ≤ 8,192** prompt tokens per pass |
+| KV | **18.00 KiB/token**, verified against the checkpoint |
+| int8 KV | 1.88–1.98× capacity, ~1.18× faster, quality-neutral |
+| int4 PLE | 53% smaller model, quality- and throughput-neutral, +13% capacity |
+| best config | `ple-4 / kv-int8 / donated` — 1.92× faster at 53% the size |
 
-**Use `ports/gemma4/jax_e_benchmark_sweep_v2.py`** — it times jitted prefill and
-steady-state cached decode separately, discards warmup, and medians over repeats.
-Correctness of the cached decode path is asserted in `tests/test_kv_cache_parity.py`
-(matches full re-forward to ~1e-6 logit delta).
+**Read the corrections in that report before quoting any number from it.** Three
+findings were withdrawn during the session: a "flat 524,288 KV tokens, 0.0% spread"
+invariant that was an artifact of a power-of-two sampling ladder; "int8 KV is
+1.2–1.8× faster", which was mostly the cost of a cache being copied every step; and
+a roofline calculation that counted the 4.70 GB PLE table as streamed when it is a
+gather.
+
+**This engine is not at the hardware limit.** Calibrated against a trivial streaming
+reduction that reaches 1,417 GB/s (86% of the published 1,640), the decode step's KV
+read runs at ~56% of that with buffer donation enabled and 19% without. Absolute
+throughput here describes this implementation, not the chip.
 
 ```bash
 python3 ports/gemma4/jax_e_benchmark_sweep_v2.py \
   --batch-sizes 1,2,4,8,16,32,64 --contexts 8,128,512,2048 --json-out results.json
 ```
 
-Expect the OOM frontier to move in versus the old grid: a real KV cache allocates memory
-the old probe never did.
+### 📚 JAX References
+
+- **[JAX advanced guides](https://docs.jax.dev/en/latest/advanced_guides.html)** —
+  the index worth reading before optimizing anything here. Its *Performance
+  optimizations* section documents **buffer donation**, which turned out to be the
+  single largest inefficiency in this engine: without it `dynamic_update_slice`
+  rebuilds the whole KV cache to write one token, costing 1.62× on a bf16 cache. We
+  found that by measuring against a calibrated bandwidth ceiling; it was in the docs
+  the entire time. *Performance benchmarking and profiling* covers the trace tooling
+  used in `benchmarks/queued/kernel_gap_suite.py`, and *JAX Memories and Host
+  Offloading* is directly relevant to the HBM accounting in the report above.
+- **Type promotion**: float8 dtypes are deliberately excluded from JAX's promotion
+  lattice, which is why a cached fp8 key meeting a bf16 query raises rather than
+  promoting — while int8 *is* in the lattice and silently contracts against raw
+  integers. See `quantize_kv` in `ports/gemma4/jax_e_model.py`.
+- **[How to think in JAX](https://docs.jax.dev/en/latest/notebooks/thinking_in_jax.html)**
+  — start here. Two of its core lessons produced the largest bugs in this engine:
+  - **JAX arrays are immutable**, so an "in-place" update is really a new array.
+    `dynamic_update_slice` writing ONE token into the KV cache therefore rebuilt
+    the whole cache every decode step, which cost 1.62x until buffer donation was
+    enabled. The immutability is the language; donation is the escape hatch.
+  - **Static vs traced values.** A Python `int` stored in a params pytree becomes a
+    tracer under `jit`, and `int()` on a tracer raises. `gather_ple` derives its
+    group count from an array SHAPE rather than a stored integer for this reason.
+  Also covers why `print` inside `jit` shows a tracer, and why dynamic shapes
+  (boolean indexing) will not compile — which is why every cache and mask in this
+  engine is statically shaped and padded to a bucket.
+- **[JAX debugging](https://docs.jax.dev/en/latest/debugging.html)** — the tools for
+  the failure mode this codebase keeps producing: things that run, report success,
+  and compute the wrong thing.
+  - `jax_debug_nans` catches NaN at the point of creation instead of many layers
+    downstream. The engine currently asserts `jnp.all(jnp.isfinite(...))` by hand
+    in a few places; this is the supported way.
+  - `jax.experimental.checkify` adds jit-compatible runtime assertions — bounds,
+    NaN, user predicates — which is what a quantized KV cache wants: a scale of
+    zero or an unwritten slot should raise, not silently produce garbage.
+  - `jax.debug.print` / `jax.debug.breakpoint` print from *inside* jit. Worth
+    knowing before hand-rolling probe wrappers, and note that wrapping a Pallas
+    kernel body breaks `pallas_call`'s inspection of it — probe the public entry
+    point instead.
+  - `jax_disable_jit` turns a traced program back into ordinary Python. The fastest
+    route through a `TracerBoolConversionError`, e.g. calling `int()` on a value
+    that came from a params pytree — see the group-size handling in `gather_ple`,
+    which derives its shape statically for exactly this reason.
 
 ### 🔑 Verified Takeaways
 - **QAT checkpoints load.** The pure-JAX path resolves the vLLM TPU loader failure

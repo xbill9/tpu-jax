@@ -55,3 +55,33 @@ When managing TPU deployments or customizing vLLM serving, apply these vLLM para
 - `.claude/skills/tpu-management/SKILL.md` — the skill: standard lifecycle, MCP tool catalog, required vLLM flags, field notes from live deployments, cautions (read this before touching TPU provisioning logic)
 - `GEMINI.md` (root) — Gemini CLI integration via a LiteLLM proxy, with `litellm_config.yaml` examples routing Gemini CLI traffic to the self-hosted Gemma 4 TPU endpoint
 - `references/tpu-guide.md` (inside the skill) — the TPU getting started guide: flex-start zones per TPU family, quota metrics and request procedure, troubleshooting
+
+## JAX References
+
+The pure-JAX engine (`ports/gemma4/`, `jax_engine.py`) is where this repo's hardest
+bugs live. Read these before optimizing or debugging it — the two largest defects
+found so far were both documented upstream the whole time.
+
+- **[How to think in JAX](https://docs.jax.dev/en/latest/notebooks/thinking_in_jax.html)**
+  — the mental model. Two of its lessons map directly onto real bugs here:
+  **arrays are immutable**, so `dynamic_update_slice` writing one token into the KV
+  cache actually rebuilds the whole cache (1.62x, fixed by buffer donation); and
+  **static vs traced values**, which is why a Python `int` in a params pytree raises
+  `TracerBoolConversionError` under `jit` (see `gather_ple`, which derives its group
+  count from an array shape instead). It also explains why dynamic shapes will not
+  compile, hence the statically shaped, bucket-padded caches and masks.
+- **[Advanced guides](https://docs.jax.dev/en/latest/advanced_guides.html)** —
+  *Performance optimizations* documents **buffer donation**, the single largest
+  inefficiency found in this engine; *Performance benchmarking and profiling* covers
+  the trace tooling in `benchmarks/queued/kernel_gap_suite.py`.
+- **[Debugging](https://docs.jax.dev/en/latest/debugging.html)** — for the failure
+  mode this codebase keeps producing: code that runs, reports success, and computes
+  the wrong thing. `jax_debug_nans`, `checkify` for jit-compatible assertions,
+  `jax.debug.print` for printing inside `jit`, `jax_disable_jit` for tracer errors.
+
+**Measurement rule earned the hard way:** a config flag being accepted is not
+evidence it did anything, and an A/B can be internally valid while its baseline is
+wrong. Cross-check against an absolute physical bound — bytes moved per second
+against calibrated bandwidth — not just against another configuration. See
+`benchmarks/runs/2026-07-29-kv-quant-v6e1/REPORT.md` for the corrections that rule
+produced.
