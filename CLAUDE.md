@@ -78,6 +78,15 @@ found so far were both documented upstream the whole time.
   mode this codebase keeps producing: code that runs, reports success, and computes
   the wrong thing. `jax_debug_nans`, `checkify` for jit-compatible assertions,
   `jax.debug.print` for printing inside `jit`, `jax_disable_jit` for tracer errors.
+- **[Gemma 4 QAT checkpoints](https://ai.google.dev/gemma/docs/core#qat)** — the
+  authority on which checkpoint variant to load. QAT simulates quantization during
+  training rather than compressing a finished model, so the int4 weights this engine
+  unpacks are not a post-hoc approximation. The suffixes are not interchangeable:
+  `-w4a16-ct` (4-bit weights / 16-bit activations) is what `jax_openai_server.py`
+  loads by default and what `w4a16_impl` decodes; `-q4_0-unquantized` ships
+  half-precision QAT weights (faster here — 10.1 vs 8.1 tok/s, see `deploy.md`);
+  `-gguf` and `-mobile-ct` target other runtimes and do not belong on TPU. Check the
+  variant list here before assuming a checkpoint exists for a given size.
 
 **Measurement rule earned the hard way:** a config flag being accepted is not
 evidence it did anything, and an A/B can be internally valid while its baseline is

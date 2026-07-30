@@ -204,6 +204,20 @@ python3 ports/gemma4/jax_e_benchmark_sweep_v2.py \
     route through a `TracerBoolConversionError`, e.g. calling `int()` on a value
     that came from a params pytree — see the group-size handling in `gather_ple`,
     which derives its shape statically for exactly this reason.
+- **[Gemma 4 QAT checkpoints](https://ai.google.dev/gemma/docs/core#qat)** — the
+  authority on which checkpoint variant to load, and the reason the int4 weights this
+  engine unpacks are not a post-hoc approximation: QAT simulates quantization *during*
+  training, so the model learns to compensate for the precision loss. The suffixes are
+  not interchangeable:
+  - `-w4a16-ct` — 4-bit weights, 16-bit activations, aimed at cloud serving. This is
+    the default `MODEL_ID` in `jax_openai_server.py` and what `w4a16_impl` decodes.
+  - `-q4_0-unquantized` — half-precision QAT weights, intended for custom compilation
+    and speculative decoding. Faster on this engine (10.1 vs 8.1 tok/s, `deploy.md`),
+    at ~4× the HBM.
+  - `-gguf` (llama.cpp-style 4-bit) and `-mobile-ct` (`wNa8o8`, 2-bit decode layers)
+    target other runtimes entirely — neither belongs on TPU.
+  QAT variants exist across E2B, E4B, 12B, 26B A4B, and 31B, but the mobile ones only
+  for E2B/E4B. Check the list here before assuming a variant exists for a given size.
 
 ### 🔑 Verified Takeaways
 - **QAT checkpoints load.** The pure-JAX path resolves the vLLM TPU loader failure
