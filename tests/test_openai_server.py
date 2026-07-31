@@ -77,6 +77,23 @@ class ServerTest(unittest.TestCase):
         body = self.client.get("/v1/models").json()
         self.assertEqual(body["data"][0]["id"], "synthetic/tiny")
 
+    def test_chat_template_accepts_transformers_5_mapping(self):
+        original = srv.TOKENIZER
+
+        class MappingTokenizer(StubTokenizer):
+            def apply_chat_template(
+                self, messages, tokenize=True, add_generation_prompt=True
+            ):
+                return {"input_ids": [11, 12, 13]}
+
+        try:
+            srv.TOKENIZER = MappingTokenizer()
+            ids = srv._chat_prompt_ids(
+                [srv.ChatMessage(role="user", content="hello")])
+        finally:
+            srv.TOKENIZER = original
+        self.assertEqual(ids, [11, 12, 13])
+
     def test_chat_completion_non_streaming(self):
         r = self.client.post("/v1/chat/completions", json={
             "messages": [{"role": "user", "content": "hello tpu"}],

@@ -299,7 +299,13 @@ def list_models():
 def _chat_prompt_ids(messages) -> list[int]:
     formatted = [{"role": m.role, "content": m.content} for m in messages]
     if hasattr(TOKENIZER, "apply_chat_template"):
-        return TOKENIZER.apply_chat_template(formatted, tokenize=True, add_generation_prompt=True)
+        encoded = TOKENIZER.apply_chat_template(
+            formatted, tokenize=True, add_generation_prompt=True)
+        # Transformers 5 may return a BatchEncoding/dict here instead of the
+        # bare token list returned by earlier versions.
+        if hasattr(encoded, "keys") and "input_ids" in encoded:
+            encoded = encoded["input_ids"]
+        return list(encoded)
     text = "\n".join(f"{m.role}: {m.content}" for m in messages)
     return TOKENIZER(text)["input_ids"]
 

@@ -94,6 +94,9 @@ Use a TPU VM with a current `jax[tpu]` installation and authenticated access to
 the gated Gemma checkpoint. Install the HTTP and checkpoint dependencies, then:
 
 ```bash
+python3 -m pip install fastapi uvicorn pydantic huggingface_hub safetensors \
+  flax transformers sentencepiece 'jinja2>=3.1'
+
 python3 jax_openai_server.py \
   --model google/gemma-4-E2B-it-qat-w4a16-ct \
   --kv-cache-dtype int8 \
