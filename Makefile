@@ -5,6 +5,11 @@ SUBDIRS := $(patsubst %/,%,$(dir $(wildcard */Makefile)))
 
 SKILL_DIR  := .claude/skills/tpu-management
 PLUGIN_DIR := skills/tpu-management
+# The inf2 skill has no repo-root source to regenerate from — it is authored in
+# place under .claude/skills/ — but it still ships a plugin copy, so `make skill`
+# mirrors it. Without this the two 500-line server.py files drift silently.
+INF2_SKILL_DIR  := .claude/skills/inf2-management
+INF2_PLUGIN_DIR := skills/inf2-management
 DIST_DIR   := dist
 
 .PHONY: all clean test lint install deploy help init skill skill-install skill-package $(SUBDIRS)
@@ -45,6 +50,12 @@ skill:
 	mkdir -p $(dir $(PLUGIN_DIR))
 	cp -r $(SKILL_DIR) $(PLUGIN_DIR)
 	@echo "Synced plugin copy -> $(PLUGIN_DIR)"
+	@if [ -d $(INF2_SKILL_DIR) ]; then \
+	  rm -rf $(INF2_PLUGIN_DIR); \
+	  mkdir -p $(dir $(INF2_PLUGIN_DIR)); \
+	  cp -r $(INF2_SKILL_DIR) $(INF2_PLUGIN_DIR); \
+	  echo "Synced plugin copy -> $(INF2_PLUGIN_DIR)"; \
+	fi
 
 skill-install: skill
 	mkdir -p $(HOME)/.claude/skills

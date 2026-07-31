@@ -21,6 +21,7 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 
+from ports.gemma4 import backend
 from ports.gemma4.jax_e_loader import convert_safetensors_to_jax_params
 from ports.gemma4.jax_e_model import (
     Gemma4EConfig,
@@ -79,10 +80,24 @@ def _is_non_text_tensor(key: str) -> bool:
     return any(marker in key for marker in _NON_TEXT_MARKERS)
 
 
+# fp8 KV storage is a TPU/GPU capability here. The cache is not a plain fp8
+# tensor: every read multiplies by a bf16 per-token scale and contracts against a
+# bf16 query, and neuronx-cc does not accept fp8 in that pattern. int8 carries the
+# same scales, halves the cache identically, and was the more accurate of the two
+# on TPU anyway (see the _CACHE_DTYPES comments), so it is the portable choice.
+_FLOAT8_CACHE_KEYS = {"fp8", "float8", "fp8_e4m3", "fp8_e5m2"}
+
+
 def resolve_cache_dtype(name: str):
     key = (name or "bf16").lower()
     if key not in _CACHE_DTYPES:
         raise ValueError(f"Unsupported kv cache dtype {name!r}; choose from {sorted(_CACHE_DTYPES)}")
+    caps = backend.caps()
+    if key in _FLOAT8_CACHE_KEYS and not caps.float8_kv:
+        raise ValueError(
+            f"kv cache dtype {name!r} is not supported on platform {caps.platform!r}; "
+            f"use 'int8' for the same one-byte capacity, or 'bf16'."
+        )
     return _CACHE_DTYPES[key]
 
 
@@ -219,7 +234,16 @@ class JaxGemmaEngine:
         # Anything holding a reference to a cache across steps must re-read it from
         # the step's return value, never reuse the object it passed in. Set False if
         # a caller needs the old cache to stay valid.
-        self.donate_cache = donate_cache
+        #
+        # A backend that cannot donate must not be asked to: depending on the
+        # plugin, `donate_argnums` either raises at compile time or is ignored
+        # with a warning and a silent copy. Either way the caller's contract
+        # (never reuse a donated buffer) still has to hold, so the flag is only
+        # ever narrowed here, never widened.
+        self.donate_cache = donate_cache and backend.caps().buffer_donation
+        if donate_cache and not self.donate_cache:
+            logger.info("buffer donation disabled: platform %r does not support it",
+                        backend.active_platform())
         # Prefill, not decode, sets the batch ceiling. Measured on v6e-1 by
         # compile-time memory_analysis: prefill temporaries are LINEAR in the total
         # prompt tokens in the pass, a flat ~2.13 MB per token from 1K to 8K tokens

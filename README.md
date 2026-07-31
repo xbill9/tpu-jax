@@ -84,6 +84,7 @@ replacement. Full results:
 | `ports/gemma4/jax_e_benchmark_sweep_v2.py` | Corrected prefill and cached-decode benchmark |
 | `jax_engine.py` | Stateful generation engine |
 | `jax_openai_server.py` | OpenAI-compatible completions, chat, SSE, health, and metrics |
+| `deployments/aws-inf2/` | JAX NeuronX/PJRT deployment scaffold for AWS Inferentia2 |
 | `tests/` | CPU correctness and API regression suite |
 | `benchmarks/runs/` | Raw logs, JSON, scripts, reports, and correction notes |
 | `benchmarks/queued/` | Hardware profiling and queued benchmark utilities |
@@ -132,6 +133,20 @@ python3 -m unittest discover -s tests
 CPU is suitable for numerical correctness, scheduling, endpoint, and SSE tests.
 It cannot validate TPU throughput, HBM capacity, compilation timing, or
 Pallas/Mosaic performance.
+
+## AWS Inferentia2 porting target
+
+The same JAX model and OpenAI server can be staged on an `inf2.xlarge` through
+AWS JAX NeuronX. The AWS-specific wrapper keeps the TPU-only Mosaic kernel off
+the native compiler, verifies that PJRT discovered a `neuron` device, fetches
+the gated-model token through Secrets Manager, and installs the server as a
+private systemd service. The EC2 launcher plans by default, enforces one tagged
+host per region, provisions the swap that a 16 GiB host needs to survive the
+Neuron graph load, and retains only the compile-cache volume on teardown.
+
+See [`deployments/aws-inf2/README.md`](deployments/aws-inf2/README.md). This is
+scaffolding awaiting real-Inf2 graph compilation, parity, and performance
+validation; TPU benchmark numbers must not be attributed to Inferentia.
 
 ## Current limitations
 

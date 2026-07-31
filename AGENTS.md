@@ -205,6 +205,16 @@ python3 ports/gemma4/jax_e_benchmark_sweep_v2.py \
     that came from a params pytree — see the group-size handling in `gather_ple`,
     which derives its shape statically for exactly this reason.
 
+### 🧩 Gemma Skills (upstream)
+
+- **[google-gemma/gemma-skills](https://github.com/google-gemma/gemma-skills)** —
+  "Skills for the Gemma and model/agent interactions" (Apache-2.0). The upstream
+  counterpart to what this repo packages: we ship `tpu-management` and
+  `inf2-management` as Claude Code skills, and this is where Gemma's own
+  skill definitions for model/agent interaction live. Check it before authoring a
+  new skill here, so naming and structure follow upstream rather than diverging.
+  Docs: <https://ai.google.dev/gemma/docs>
+
 ### 🔑 Verified Takeaways
 - **QAT checkpoints load.** The pure-JAX path resolves the vLLM TPU loader failure
   (`#3225`: `k_norm` demanded for KV-shared layers 15–34 that the checkpoint legitimately

@@ -1,0 +1,28 @@
+# Python dependencies for serving the pure-JAX Gemma 4 engine on Inf2.
+#
+# NOT the repo-root requirements.txt. That file lists the *MCP server's* deps
+# (mcp, httpx, openai, google-cloud-secret-manager) and contains none of the
+# serving stack — a host bootstrapped from it installs cleanly and then dies on
+# `import fastapi` before the model is ever touched.
+#
+# jax / jaxlib are deliberately absent: user_data.sh installs them from the
+# Neuron package index via `jax-neuronx[stable]`, which pins the tested
+# JAX/jaxlib/libneuronxla combination for the SDK line. Listing jax here would
+# let pip resolve a PyPI build with no Neuron PJRT plugin, which fails at
+# runtime as "no Neuron device found" rather than as a dependency conflict.
+
+# HTTP surface — jax_openai_server.py
+fastapi
+uvicorn[standard]
+pydantic
+
+# Checkpoint loading — jax_engine.load() imports safetensors.flax, and
+# _download() imports huggingface_hub.
+safetensors
+huggingface_hub
+
+# Tokenizer — jax_openai_server.py imports transformers.AutoTokenizer.
+# Also pulls in huggingface_hub, safetensors, and tokenizers; both are listed
+# above anyway so the requirement is explicit rather than transitive.
+# transformers does NOT require torch for tokenizer-only use.
+transformers

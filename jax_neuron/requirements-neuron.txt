@@ -1,0 +1,5 @@
+# Install from the AWS Neuron package index:
+# pip install -r requirements-neuron.txt \
+#   --extra-index-url=https://pip.repos.neuron.amazonaws.com
+jax-neuronx[stable]
+

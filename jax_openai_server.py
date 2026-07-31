@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""OpenAI-Compatible FastAPI Server for pure JAX Gemma 4 on TPU v6e-1.
+"""OpenAI-compatible FastAPI server for the pure-JAX Gemma 4 engine.
 
 Generation runs entirely on the pure-JAX engine in ``jax_engine.py`` (no
 PyTorch, no torch_xla) against a static KV cache, so every streamed token
@@ -24,11 +24,13 @@ import time
 import jax
 from pydantic import BaseModel
 
-# Enable native TPU MXU bfloat16 matmul precision
+# Request BF16 matmul precision on accelerator backends.
 jax.config.update("jax_default_matmul_precision", "bfloat16")
 
 # Persistent XLA compilation disk cache (skips ~17s of compilation on restarts)
-_cache_dir = os.path.expanduser("~/.cache/jax_compilation_cache")
+_cache_dir = os.path.expanduser(
+    os.environ.get("JAX_COMPILATION_CACHE_DIR", "~/.cache/jax_compilation_cache")
+)
 os.makedirs(_cache_dir, exist_ok=True)
 jax.config.update("jax_compilation_cache_dir", _cache_dir)
 jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
@@ -56,7 +58,7 @@ METRICS = {
     "last_prefill_ms": 0.0,
 }
 
-app = FastAPI(title="Pure JAX Gemma 4 W4A16 QAT Server on TPU v6e-1")
+app = FastAPI(title="Pure JAX Gemma 4 W4A16 QAT Server")
 
 
 class ChatMessage(BaseModel):
@@ -291,7 +293,7 @@ def list_models():
     return {
         "object": "list",
         "data": [
-            {"id": MODEL_ID, "object": "model", "created": int(time.time()), "owned_by": "jax-tpu"}
+            {"id": MODEL_ID, "object": "model", "created": int(time.time()), "owned_by": "jax"}
         ],
     }
 
