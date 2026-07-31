@@ -24,24 +24,42 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 
+from ports.gemma4 import backend
+
 logger = logging.getLogger(__name__)
 
-# Pallas has no TPU backend on a CPU host; interpret mode lets the fused W4A16
-# kernel run (slowly) so its numerics can be tested off-TPU. Auto-enabled when no
-# TPU is present; override with JAX_E_PALLAS_INTERPRET=1/0.
+_CAPS = backend.caps()
+
+# Mosaic cannot lower on a CPU host; interpret mode lets the fused W4A16 kernel
+# run (slowly) so its numerics can be tested off-TPU. Defaults from the backend
+# capability table; override with JAX_E_PALLAS_INTERPRET=1/0.
+#
+# On Neuron this is NOT a fallback that makes the fused kernel usable. The
+# interpreter traces the kernel body into the enclosing graph, unrolling the K
+# loop over every tile, which is a far worse graph than the reference path that
+# is the default anyway. `set_w4a16_impl` refuses "fused" there for that reason;
+# interpret mode remains reachable only for numerics tests.
 _PALLAS_INTERPRET = os.environ.get(
     "JAX_E_PALLAS_INTERPRET",
-    "1" if not any(d.platform == "tpu" for d in jax.devices()) else "0",
+    "1" if _CAPS.pallas_interpret else "0",
 ) == "1"
 
-# Enable native TPU MXU bfloat16 matmul precision by default
-jax.config.update("jax_default_matmul_precision", "bfloat16")
+# Native MXU bfloat16 matmul precision. TPU-only concept: on Neuron the compiler
+# picks the datapath itself, and forcing it here would only degrade the CPU
+# reference run that Inf2 debugging depends on.
+if _CAPS.default_bf16_matmul:
+    jax.config.update("jax_default_matmul_precision", "bfloat16")
 
-# Persistent JAX XLA Compilation Disk Cache (skips ~17s compilation on restart)
-_cache_dir = os.path.expanduser("~/.cache/jax_compilation_cache")
-os.makedirs(_cache_dir, exist_ok=True)
-jax.config.update("jax_compilation_cache_dir", _cache_dir)
-jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
+# Persistent JAX XLA Compilation Disk Cache (skips ~17s compilation on restart).
+# Neuron keeps its own NEFF cache (NEURON_CC_FLAGS --cache_dir), so JAX's layer
+# is skipped there rather than stacked on top of it.
+if _CAPS.persistent_compilation_cache:
+    _cache_dir = os.path.expanduser(
+        os.environ.get("JAX_COMPILATION_CACHE_DIR", "~/.cache/jax_compilation_cache")
+    )
+    os.makedirs(_cache_dir, exist_ok=True)
+    jax.config.update("jax_compilation_cache_dir", _cache_dir)
+    jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
 
 
 @dataclasses.dataclass
@@ -218,6 +236,21 @@ def set_w4a16_impl(impl: str = "auto", layout: str = "plane") -> None:
         raise ValueError(f"impl must be auto|fused|reference, got {impl!r}")
     if layout not in ("interleaved", "plane"):
         raise ValueError(f"layout must be interleaved|plane, got {layout!r}")
+    # Pallas lowers through Mosaic (TPU/GPU only). Neuron compiles ahead of time
+    # with neuronx-cc and can never accept this kernel, so "fused" is refused
+    # outright instead of failing at trace time inside the first decode step,
+    # and "auto" resolves without pretending a fallback was a choice.
+    if impl != "reference" and not _CAPS.pallas:
+        if impl == "fused":
+            raise RuntimeError(
+                f"W4A16 impl 'fused' requires a Pallas backend; platform "
+                f"{_CAPS.platform!r} has none. Use impl='reference'."
+            )
+        logger.info(
+            "W4A16 impl 'auto' resolved to 'reference': no Pallas backend on %s",
+            _CAPS.platform,
+        )
+        impl = "reference"
     _W4A16_IMPL, _W4A16_LAYOUT = impl, layout
     _W4A16_FUSED_OK = None
 
@@ -373,16 +406,38 @@ def apply_rope_jax(
 _MASK_MIN = -1e9
 
 
-def make_ring_decode_mask(batch: int, window: int, positions_written: jax.Array) -> jax.Array:
+def make_ring_decode_mask(valid: jax.Array, ring_len: int,
+                          positions_written: jax.Array) -> jax.Array:
     """Additive mask over a windowed sliding layer's ring buffer at decode.
 
-    The ring holds exactly the most recent `window` positions, so once it has
-    wrapped every slot is valid and no window arithmetic is needed — before that,
-    only slots [0, positions_written) hold real tokens. Returns [B, 1, 1, window].
+    valid: [B, T] bool over PHYSICAL cache slots — False for prompt padding.
+    Returns [B, 1, 1, ring_len].
+
+    This used to take only a batch size and mark every slot below
+    `positions_written` as attendable, on the assumption that the ring is densely
+    packed with real tokens. It is not. Prompts are padded up to a bucket before
+    prefill, so slots between the true prompt length and the bucket boundary hold
+    zeroed K/V, and a sliding layer was attending to all of them — 58 padding
+    slots out of 64 for a short prompt. The global layers never had this problem
+    because their mask is built from `valid`.
+
+    The symptom was not a crash. Greedy decode stayed fluent and drifted: it
+    matched the reference for a few tokens, then degenerated into an endless
+    repeat. Only an A/B against the PyTorch oracle with windowing toggled
+    isolated it, which is why `tests/test_windowed_kv.py` now runs padded
+    prompts — every case there previously passed `valid_prompt = ones(...)`,
+    so padding and windowing were never exercised together.
     """
-    idx = jnp.arange(window)[None, :]
-    filled = jnp.minimum(jnp.asarray(positions_written, jnp.int32), window)
-    ok = jnp.broadcast_to(idx < filled, (batch, window))
+    B, T = valid.shape
+    j = jnp.arange(ring_len, dtype=jnp.int32)
+    n = jnp.asarray(positions_written, jnp.int32)
+    # Ring slot j holds the most recent position congruent to j mod ring_len,
+    # i.e. the largest p <= n-1 with p % ring_len == j. Floor division drives p
+    # negative when no position has landed in that slot yet.
+    p = ((n - 1 - j) // ring_len) * ring_len + j
+    live = (p >= 0) & (p < T)
+    ok = live & jnp.take_along_axis(
+        valid, jnp.broadcast_to(jnp.clip(p, 0, T - 1)[None, :], (B, ring_len)), axis=1)
     return jnp.where(ok[:, None, None, :], 0.0, _MASK_MIN).astype(jnp.float32)
 
 
@@ -1141,7 +1196,21 @@ def quantize_ple_table(params: Dict[str, jax.Array], bits: int = 8,
     # to float32 in one shot needs 8.75 GB, which OOMs a v6e-1 that already holds
     # the rest of the parameters. Chunking bounds the working set to a few hundred
     # MB, and doing it off-device leaves HBM entirely alone.
-    cpu = jax.devices("cpu")[0]
+    # A host device is only guaranteed when the CPU backend is in JAX_PLATFORMS.
+    # The Inf2 entrypoint sets "neuron,cpu" for exactly this reason; if someone
+    # narrows it to "neuron", say so instead of dying inside an IndexError, and
+    # fall back to quantizing on the accelerator (correct, just memory-hungry).
+    try:
+        cpu = jax.devices("cpu")[0]
+    except (RuntimeError, IndexError):
+        logger.warning(
+            "No CPU device available (JAX_PLATFORMS=%r); quantizing the %.2f GB "
+            "PLE table on the accelerator, which needs ~2x its float32 size free. "
+            "Add 'cpu' to JAX_PLATFORMS to do this on the host.",
+            os.environ.get("JAX_PLATFORMS", ""),
+            tbl.size * jnp.dtype(tbl.dtype).itemsize / 1e9,
+        )
+        cpu = None
     # Where the table came from is where the quantized copy must end up. Leaving
     # it on the host is catastrophic and silent in the wrong direction: capacity
     # measurements look BETTER (the table no longer occupies HBM at all) while
@@ -1152,7 +1221,9 @@ def quantize_ple_table(params: Dict[str, jax.Array], bits: int = 8,
     rows_per_chunk = max(1, (1 << 26) // (LD * 4))       # ~256 MB of float32
     q_chunks, s_chunks = [], []
     for start in range(0, V, rows_per_chunk):
-        blk = jax.device_put(tbl[start:start + rows_per_chunk], cpu)
+        blk = tbl[start:start + rows_per_chunk]
+        if cpu is not None:
+            blk = jax.device_put(blk, cpu)
         blk = blk.astype(jnp.float32).reshape(-1, LD // g, g)
         amax = jnp.max(jnp.abs(blk), axis=-1, keepdims=True)
         scale = jnp.maximum(amax, 1e-8) / qmax
@@ -1374,6 +1445,20 @@ def chunked_prefill_with_kv_cache(
     return last_logits, caches, valid
 
 
+def _sliding_ring_len(config: Gemma4EConfig, caches: Dict[int, Tuple[jax.Array, ...]],
+                      window: int) -> int:
+    """Slots actually allocated to a windowed sliding layer's ring buffer.
+
+    `init_kv_cache` sizes these as `min(max_seq_len, sliding_window)`, so the
+    buffer is the authority on its own width and the config is not. Static at
+    trace time — cache shapes are concrete — so this stays jit-compatible.
+    """
+    for i in sorted(caches):
+        if config.layer_types[i] == "sliding_attention":
+            return int(caches[i][0].shape[2])
+    return window
+
+
 def make_cached_decode_step(model: Gemma4EModelJAX, quant_mode: str = "w4a16",
                             window_kv: bool = False):
     """Build a jittable single-token decode step over a static KV cache.
@@ -1390,8 +1475,17 @@ def make_cached_decode_step(model: Gemma4EModelJAX, quant_mode: str = "w4a16",
             sliding_mask = None
         elif window_kv:
             # Sliding layers attend over their ring buffer, not the full cache.
+            # The ring is `min(total_len, window)` slots, NOT `window`:
+            # init_kv_cache clamps it, so a generation shorter than the window
+            # gets a buffer narrower than the window. Taking the width from the
+            # config instead of from the buffer the scores are computed against
+            # produced
+            #   add got incompatible shapes for broadcasting:
+            #   (1, 8, 1, 88), (1, 1, 1, 512)
+            # on a 64-token bucket with 24 new tokens against E2B's 512 window.
             sliding_mask = make_ring_decode_mask(
-                valid.shape[0], int(window), jnp.asarray(slot, jnp.int32) + 1)
+                valid, _sliding_ring_len(model.config, caches, int(window)),
+                jnp.asarray(slot, jnp.int32) + 1)
         else:
             sliding_mask = make_decode_mask(valid, window=window, slot=slot)
         logits, caches = model(
@@ -1527,14 +1621,21 @@ def pad_to_tpu_v6e_bucket(input_ids: jax.Array, pad_token_id: int = 0) -> Tuple[
     return padded_ids, mask
 
 
+# Inferentia2's PE array is 128x128 as well and neuronx-cc is likewise an
+# ahead-of-time, static-shape compiler, so the same bucket ladder serves both
+# backends and the padding rule needs no platform branch — only a name that does
+# not claim otherwise. `pad_to_tpu_v6e_bucket` stays as the historical spelling.
+pad_to_static_bucket = pad_to_tpu_v6e_bucket
+
+
 def onchip_sample_tpu_v6e_jax(
     logits: jax.Array,           # [B, V] where V = 262,144 (2,048 x 128 tile-aligned)
     prng_key: jax.Array,
     temperature: float = 0.7,
     top_k: int = 40,
 ) -> jax.Array:
-    """Vectorized on-chip Top-K sampling executed 100% on TPU core (zero host latency)."""
-    B, V = logits.shape
+    """Vectorized on-chip Top-K sampling executed 100% on the accelerator."""
+    V = logits.shape[-1]
 
     if temperature <= 0.0:
         return jnp.argmax(logits, axis=-1, keepdims=True)
@@ -1542,9 +1643,79 @@ def onchip_sample_tpu_v6e_jax(
     scaled_logits = logits / max(temperature, 1e-5)
 
     if top_k > 0 and top_k < V:
-        top_k_val, top_k_idx = jax.lax.top_k(scaled_logits, top_k)
-        mask_val = jnp.full_like(scaled_logits, -1e9)
-        scaled_logits = mask_val.at[jnp.arange(B)[:, None], top_k_idx].set(top_k_val)
+        scaled_logits = _top_k_mask(scaled_logits, top_k)
 
     sampled_idx = jax.random.categorical(prng_key, scaled_logits, axis=-1)
     return sampled_idx[:, None]
+
+
+# Guard on the unrolled threshold search below. Each round is two full passes
+# over the vocabulary, so a large k is both a big graph and a long dependent
+# chain. 40 is the serving default and 128 leaves generous headroom.
+_MAX_UNROLLED_TOP_K = 128
+
+
+def _kth_largest(scaled_logits: jax.Array, top_k: int) -> jax.Array:
+    """The k-th largest value of each row, as [B, 1].
+
+    `jax.lax.top_k` is the obvious way and the way TPU keeps using. neuronx-cc
+    2.26 rejects it outright when targeting inf2:
+
+        [NCC_EVRF001] Operator topk is not supported. Locate the operator in
+        source or libraries and replace it with an alternate implementation via
+        Neuron Kernel Interface (NKI).
+
+    The substitute peels the maximum off k-1 times, masking each one out, and
+    takes the max of what is left. Only `max` and `where`, both of which compile.
+    Two other formulations were tried against the compiler: a full `jnp.sort` also
+    compiles but is O(V log V) over 262144 elements and produced a 2.5 MB NEFF
+    against 0.1 MB for this one, and `lax.top_k` fails as above.
+
+    Ties: a round masks out *every* element equal to the current max, so with
+    duplicates this returns the k-th largest DISTINCT value and the caller keeps
+    more than k candidates. That widens the sampled distribution slightly rather
+    than truncating it, which is the safe direction to err.
+    """
+    if _CAPS.device_top_k:
+        return jax.lax.top_k(scaled_logits, top_k)[0][:, -1:]
+
+    if top_k > _MAX_UNROLLED_TOP_K:
+        raise ValueError(
+            f"top_k={top_k} exceeds {_MAX_UNROLLED_TOP_K} on platform "
+            f"{_CAPS.platform!r}, which has no device top_k and must unroll the "
+            f"threshold search. Lower top_k, or sample on the host."
+        )
+    current = scaled_logits
+    for _ in range(top_k - 1):
+        peak = jnp.max(current, axis=-1, keepdims=True)
+        current = jnp.where(current >= peak, -jnp.inf, current)
+    return jnp.max(current, axis=-1, keepdims=True)
+
+
+def _top_k_mask(scaled_logits: jax.Array, top_k: int) -> jax.Array:
+    """Set everything outside the top-k of each row to -1e9.
+
+    Two formulations, identical except at exact ties on the k-th value:
+
+      scatter   — build a -1e9 row and write the k winners back by index. Exact
+                  by construction: always exactly k survivors.
+      threshold — keep every element >= the k-th largest value. If the k-th value
+                  is tied across j elements, all j survive instead of an
+                  arbitrary subset.
+
+    The split is on `lax.top_k`, not on the scatter. The scatter itself compiles
+    for inf2 — that was checked in isolation, feeding it indices and values as
+    inputs so `topk` could not fail first — but it is useless without the indices
+    only `top_k` produces, so a backend that lacks `top_k` takes the threshold
+    form regardless. Ties in a softmax over 262144 float logits are rare, and
+    when they happen the threshold form keeps *more* of the distribution rather
+    than truncating it. TPU keeps the measured path unchanged.
+    """
+    if _CAPS.device_top_k:
+        B = scaled_logits.shape[0]
+        top_k_val, top_k_idx = jax.lax.top_k(scaled_logits, top_k)
+        mask_val = jnp.full_like(scaled_logits, -1e9)
+        return mask_val.at[jnp.arange(B)[:, None], top_k_idx].set(top_k_val)
+
+    kth = _kth_largest(scaled_logits, top_k)                    # [B, 1]
+    return jnp.where(scaled_logits >= kth, scaled_logits, -1e9)
