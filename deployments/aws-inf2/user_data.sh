@@ -13,20 +13,35 @@ NEURON_CC_FLAGS_VALUE=__NEURON_CC_FLAGS__
 exec > >(tee /var/log/gemma4-jax-inf2-bootstrap.log | logger -t gemma4-inf2 -s 2>/dev/console) 2>&1
 
 export DEBIAN_FRONTEND=noninteractive
-# needrestart restarts any daemon whose libraries an unattended upgrade touched.
-# It will happily stop this unit mid-neuronx-cc; the compile cannot exit within
-# TimeoutStopSec, so systemd SIGKILLs it and the request dies with an empty
-# reply. On a single-purpose inference host, unattended restarts are strictly a
-# liability -- patch it on your own schedule instead.
-export NEEDRESTART_MODE=l
-systemctl disable --now unattended-upgrades apt-daily.timer apt-daily-upgrade.timer \
-  apt-daily.service apt-daily-upgrade.service 2>/dev/null || true
-apt-get purge -y unattended-upgrades needrestart 2>/dev/null || true
-apt-get update
-# The Neuron DLAMI already ships AWS CLI v2 and the Python the Neuron wheels are
-# built against; do not install a second interpreter or a v1 CLI over them.
-apt-get install -y python3-pip
 command -v aws >/dev/null || { echo "FATAL: AWS CLI missing from the AMI" >&2; exit 1; }
+
+# Launching from an AMI captured off a working host? Then apt and pip have
+# nothing to do, and re-running them costs ~2 of the ~3.8 minutes to serving
+# purely to conclude "already installed". Probe for the finished stack once and
+# skip both. The source refresh, env file, unit and restart still run, so the
+# host always ends up on the current bundle rather than the baked-in copy.
+if python3 -c 'import jax, jax_neuronx, libneuronxla' >/dev/null 2>&1; then
+  STACK_PRESENT=1
+  echo "jax-neuronx stack already present; skipping apt and pip"
+else
+  STACK_PRESENT=0
+fi
+
+if [ "$STACK_PRESENT" -eq 0 ]; then
+  # needrestart restarts any daemon whose libraries an unattended upgrade
+  # touched. It will happily stop this unit mid-neuronx-cc; the compile cannot
+  # exit within TimeoutStopSec, so systemd SIGKILLs it and the request dies with
+  # an empty reply. On a single-purpose inference host, unattended restarts are
+  # strictly a liability -- patch it on your own schedule instead.
+  export NEEDRESTART_MODE=l
+  systemctl disable --now unattended-upgrades apt-daily.timer apt-daily-upgrade.timer \
+    apt-daily.service apt-daily-upgrade.service 2>/dev/null || true
+  apt-get purge -y unattended-upgrades needrestart 2>/dev/null || true
+  apt-get update
+  # The Neuron DLAMI already ships AWS CLI v2 and the Python the Neuron wheels
+  # are built against; do not install a second interpreter or a v1 CLI over them.
+  apt-get install -y python3-pip
+fi
 
 # inf2.xlarge is 4 vCPU / 16 GB host. Field-measured on the sibling NxD port:
 # the one-time Neuron graph load peaks ~14.5 GB, and a stock DLAMI with no swap
@@ -65,7 +80,11 @@ if [ -n "$cache_dev" ]; then
   install -d "$CACHE_ROOT"
   grep -q '^LABEL=gemma4cache' /etc/fstab ||
     echo "LABEL=gemma4cache $CACHE_ROOT ext4 defaults,nofail 0 2" >>/etc/fstab
-  mount "$CACHE_ROOT"
+  # Idempotent: an AMI captured from a previous host carries that fstab entry,
+  # so systemd has already mounted the volume by the time user-data runs. A
+  # second mount fails, and under `set -e` that aborts the whole bootstrap --
+  # including the S3 source refresh -- while leaving a service that looks fine.
+  mountpoint -q "$CACHE_ROOT" || mount "$CACHE_ROOT"
 else
   echo "WARNING: no separate cache volume attached; caches land on the root volume" >&2
 fi
@@ -93,12 +112,21 @@ PIP="python3 -m pip install --break-system-packages --ignore-installed"
 # driver, runtime, and interpreter, and pip supplies the framework. The stable
 # metapackage selects the tested JAX/jaxlib/libneuronxla combination; jaxlib
 # resolves from PyPI, only libneuronxla comes from this index.
-$PIP 'jax-neuronx[stable]==0.10.0.1.0.*' \
-  --extra-index-url https://pip.repos.neuron.amazonaws.com
-# The repo-root requirements.txt is the MCP server's, not the serving path's --
-# installing only that leaves fastapi/transformers/safetensors/huggingface_hub
-# missing and the unit crash-loops on ImportError after a clean bootstrap.
-$PIP -r /opt/gemma4/app/deployments/aws-inf2/requirements-serving.txt
+if [ "$STACK_PRESENT" -eq 0 ]; then
+  $PIP 'jax-neuronx[stable]==0.10.0.1.0.*' \
+    --extra-index-url https://pip.repos.neuron.amazonaws.com
+  # The repo-root requirements.txt is the MCP server's, not the serving path's
+  # -- installing only that leaves fastapi/transformers/safetensors/
+  # huggingface_hub missing and the unit crash-loops on ImportError after a
+  # clean bootstrap.
+  $PIP -r /opt/gemma4/app/deployments/aws-inf2/requirements-serving.txt
+else
+  # Cheap insurance: the AMI satisfied jax-neuronx, but the serving deps come
+  # from a file in the bundle and may have grown since the image was baked.
+  python3 -c 'import fastapi, transformers, safetensors, huggingface_hub' \
+    >/dev/null 2>&1 ||
+    $PIP -r /opt/gemma4/app/deployments/aws-inf2/requirements-serving.txt
+fi
 
 cat >/usr/local/bin/gemma4-fetch-hf-token <<'SCRIPT'
 #!/bin/bash

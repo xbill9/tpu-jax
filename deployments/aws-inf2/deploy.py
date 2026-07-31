@@ -221,9 +221,19 @@ def launch(config: Config, apply: bool) -> dict[str, Any]:
         # Drop the blank cache volume from the mapping; the retained one is
         # attached after the instance reaches `running` (attach_volume cannot
         # run against a pending instance).
+        #
+        # NoDevice, not merely absent: an AMI captured from a host that had a
+        # cache volume carries its own CACHE_DEVICE mapping, so leaving it out
+        # of the request silently restores a volume from the AMI's snapshot and
+        # AttachVolume then fails with "attachment point already in use".
+        # Suppressing it also avoids the restore itself, which is worth avoiding
+        # on its own: a snapshot-restored volume lazy-loads from S3 on first
+        # touch -- measured at 6 MB/s here, so reading back a 7.8 GB weight
+        # cache takes ~22 minutes, slower than downloading the weights fresh.
+        # The retained volume has no such penalty.
         request["BlockDeviceMappings"] = [
             m for m in request["BlockDeviceMappings"] if m["DeviceName"] != CACHE_DEVICE
-        ]
+        ] + [{"DeviceName": CACHE_DEVICE, "NoDevice": ""}]
 
     if config.market_type == "spot":
         request["InstanceMarketOptions"] = {
