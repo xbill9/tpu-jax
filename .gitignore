@@ -44,3 +44,16 @@ coverage.xml
 # Local environment (contains live API keys)
 .env
 
+# Live AWS session credentials written by save-aws-creds.sh
+.aws_creds
+
+
+# Neuron compile probe artifacts (HLO modules, NEFFs) — jax_neuron/compile_probe.py
+.neuron_compile_probe/
+
+# neuronx-cc working state. The compiler scatters these through its CWD and
+# cleans up none of them; compile_probe.py runs it inside the artifact dir, but
+# a hand-run `neuronx-cc compile` from the repo root will still drop them here.
+log-neuron-cc.txt
+global_metric_store.json
+neuronxcc-*/
