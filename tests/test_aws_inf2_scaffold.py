@@ -55,13 +55,42 @@ def config(**overrides):
 
 
 class FakeEc2:
-    def __init__(self, instances=None):
+    def __init__(self, instances=None, volumes=None, az="us-east-1a"):
         self.instances = instances or []
+        self.volumes = volumes or []
+        self.az = az
         self.run_request = None
         self.terminated = None
+        self.created_volume = None
+        self.attached = None
+        self.deleted_volumes = []
 
     def describe_instances(self, **_kwargs):
         return {"Reservations": [{"Instances": self.instances}]}
+
+    def describe_subnets(self, **_kwargs):
+        return {"Subnets": [{"AvailabilityZone": self.az}]}
+
+    def describe_volumes(self, **kwargs):
+        if "VolumeIds" in kwargs:
+            wanted = set(kwargs["VolumeIds"])
+            return {"Volumes": [v for v in self.volumes if v["VolumeId"] in wanted]}
+        return {"Volumes": list(self.volumes)}
+
+    def create_volume(self, **kwargs):
+        self.created_volume = kwargs
+        return {"VolumeId": "vol-created"}
+
+    def attach_volume(self, **kwargs):
+        self.attached = kwargs
+        return {}
+
+    def delete_volume(self, **kwargs):
+        self.deleted_volumes.append(kwargs["VolumeId"])
+        return {}
+
+    def get_waiter(self, _name):
+        return mock.Mock()
 
     def run_instances(self, **kwargs):
         self.run_request = kwargs
@@ -70,6 +99,11 @@ class FakeEc2:
     def terminate_instances(self, **kwargs):
         self.terminated = kwargs
         return {"TerminatingInstances": []}
+
+
+def volume(volume_id="vol-cache", az="us-east-1a", state="available", created=1):
+    return {"VolumeId": volume_id, "AvailabilityZone": az, "State": state,
+            "CreateTime": created}
 
 
 def patched(ec2):
@@ -126,15 +160,57 @@ class Inf2ScaffoldTests(unittest.TestCase):
             ec2.run_request["InstanceMarketOptions"]["MarketType"], "spot"
         )
 
-    def test_root_volume_is_disposable_and_cache_volume_persists(self):
+    def test_root_volume_is_disposable_and_cache_volume_is_attached_separately(self):
         ec2 = FakeEc2()
         with patched(ec2):
-            deploy.launch(config(), apply=True)
+            result = deploy.launch(config(), apply=True)
         mappings = devices(ec2.run_request)
         # A retained root volume is a pure cost leak: nothing ever reattaches it.
         self.assertTrue(mappings[deploy.ROOT_DEVICE]["DeleteOnTermination"])
-        self.assertFalse(mappings[deploy.CACHE_DEVICE]["DeleteOnTermination"])
-        self.assertTrue(mappings[deploy.CACHE_DEVICE]["Encrypted"])
+        # RunInstances can only CREATE volumes, never attach an existing one, so
+        # the cache volume must not be described here — that is what silently
+        # minted a new volume per launch while the old one billed unattached.
+        self.assertNotIn(deploy.CACHE_DEVICE, mappings)
+        self.assertTrue(ec2.created_volume["Encrypted"])
+        self.assertEqual(ec2.attached["VolumeId"], "vol-created")
+        self.assertEqual(ec2.attached["Device"], deploy.CACHE_DEVICE)
+        self.assertEqual(result["cache_volume_attached"], "vol-created")
+
+    def test_reuse_cache_attaches_the_existing_volume(self):
+        """The startup win: no new volume, so the checkpoint and NEFFs survive."""
+        ec2 = FakeEc2(volumes=[volume("vol-warm")])
+        with patched(ec2):
+            result = deploy.launch(config(reuse_cache=True), apply=True)
+        self.assertIsNone(ec2.created_volume)
+        self.assertEqual(ec2.attached["VolumeId"], "vol-warm")
+        self.assertEqual(result["cache_volume"]["action"], "reuse")
+
+    def test_reuse_cache_falls_back_to_a_fresh_volume(self):
+        ec2 = FakeEc2(volumes=[])
+        with patched(ec2):
+            result = deploy.launch(config(reuse_cache=True), apply=False)
+        self.assertEqual(result["cache_volume"]["action"], "create")
+
+    def test_ambiguous_reusable_volumes_are_an_error(self):
+        """Attaching the wrong cache is worse than a cold start: it looks fine."""
+        ec2 = FakeEc2(volumes=[volume("vol-a"), volume("vol-b")])
+        with patched(ec2):
+            with self.assertRaisesRegex(RuntimeError, "vol-a"):
+                deploy.launch(config(reuse_cache=True), apply=False)
+
+    def test_cache_volume_in_the_wrong_az_is_refused(self):
+        """EBS is AZ-locked; a mismatch must name both AZs, not fail obscurely."""
+        ec2 = FakeEc2(volumes=[volume("vol-elsewhere", az="us-east-1c")],
+                      az="us-east-1a")
+        with patched(ec2):
+            with self.assertRaisesRegex(RuntimeError, "us-east-1c"):
+                deploy.launch(config(cache_volume_id="vol-elsewhere"), apply=False)
+
+    def test_attached_cache_volume_is_refused(self):
+        ec2 = FakeEc2(volumes=[volume("vol-busy", state="in-use")])
+        with patched(ec2):
+            with self.assertRaisesRegex(RuntimeError, "in-use"):
+                deploy.launch(config(cache_volume_id="vol-busy"), apply=False)
 
     def test_auto_discovered_ami_is_flagged_as_unpinned(self):
         ec2 = FakeEc2()
@@ -155,7 +231,34 @@ class Inf2ScaffoldTests(unittest.TestCase):
             result = deploy.terminate(config(), apply=False)
         self.assertEqual(result["action"], "plan")
         self.assertEqual(result["targets"][0]["cache_volume_id"], "vol-cache")
+        self.assertEqual(result["cache_volumes"], "retain")
         self.assertIsNone(ec2.terminated)
+
+    def test_terminate_can_delete_the_cache_volume(self):
+        """Cleanup has to be a supported action, or orphans accumulate silently."""
+        host = {
+            "InstanceId": "i-existing",
+            "BlockDeviceMappings": [
+                {"DeviceName": deploy.CACHE_DEVICE, "Ebs": {"VolumeId": "vol-cache"}},
+            ],
+        }
+        ec2 = FakeEc2([host])
+        with patched(ec2):
+            result = deploy.terminate(config(delete_cache=True), apply=True)
+        self.assertEqual(ec2.deleted_volumes, ["vol-cache"])
+        self.assertEqual(result["deleted_volumes"], ["vol-cache"])
+
+    def test_terminate_retains_the_cache_volume_by_default(self):
+        host = {
+            "InstanceId": "i-existing",
+            "BlockDeviceMappings": [
+                {"DeviceName": deploy.CACHE_DEVICE, "Ebs": {"VolumeId": "vol-cache"}},
+            ],
+        }
+        ec2 = FakeEc2([host])
+        with patched(ec2):
+            deploy.terminate(config(), apply=True)
+        self.assertEqual(ec2.deleted_volumes, [])
 
     def test_terminate_apply_terminates_only_tagged_hosts(self):
         ec2 = FakeEc2([{"InstanceId": "i-existing"}])
@@ -241,6 +344,53 @@ class UserDataShellTests(unittest.TestCase):
 
     def test_swap_can_be_disabled_on_a_large_host(self):
         self.assertIn('SWAP_GIB=0\n', deploy.render_user_data(config(swap_gib=0)))
+
+    def test_bootstrap_waits_for_a_reattached_cache_volume(self):
+        """deploy.py attaches a reused volume after run_instances returns.
+
+        The old code looked for the device exactly once. On a fast boot it found
+        nothing, warned, and put the 9.6 GB checkpoint plus the Neuron cache on
+        the root volume that dies at termination — losing the entire saving to a
+        warning nobody reads.
+        """
+        text = self.rendered()
+        self.assertIn("CACHE_WAIT_SECS=", text)
+        wait = text.index("deadline=$(( SECONDS + CACHE_WAIT_SECS ))")
+        self.assertLess(wait, text.index("blkid"))
+
+    def test_cache_volume_is_never_reformatted_when_it_holds_data(self):
+        """mkfs on a warm cache would silently destroy the whole point of it."""
+        text = self.rendered()
+        self.assertIn('blkid "$cache_dev" >/dev/null 2>&1 || mkfs.ext4', text)
+
+    def test_bootstrap_phases_are_skippable_so_a_retry_is_cheap(self):
+        text = self.rendered()
+        self.assertIn("phase_done()", text)
+        for phase in ("os-packages", "python-deps", "neuron-probe"):
+            self.assertIn(f"phase_done {phase}", text)
+        # A bare `mount` of an already-mounted path exits non-zero, and under
+        # `set -e` that aborted the script — which made a retry impossible.
+        self.assertIn('mountpoint -q "$CACHE_ROOT" || mount "$CACHE_ROOT"', text)
+
+    def test_the_source_bundle_is_never_phase_skipped(self):
+        """It is the one thing that changes between runs; skipping serves stale code."""
+        text = self.rendered()
+        self.assertNotIn("phase_done source", text)
+        self.assertIn("aws s3 cp", text)
+
+    def test_probe_gates_the_bootstrap_before_the_expensive_steps(self):
+        """A broken stack should cost a minute, not the download plus a compile."""
+        text = self.rendered()
+        probe = text.index("jax_neuron/probe.py")
+        self.assertLess(probe, text.index("systemctl enable"))
+        self.assertIn("FATAL: the JAX Neuron stack does not work", text)
+
+    def test_probe_and_service_share_one_path_definition(self):
+        """Two PATH strings would drift, and the drift only shows at first compile."""
+        text = self.rendered()
+        self.assertIn("SERVICE_PATH=/opt/gemma4/venv/bin:", text)
+        self.assertIn("PATH=$SERVICE_PATH", text)
+        self.assertIn('PATH="$SERVICE_PATH"', text)
 
     def test_compiler_flags_reach_the_service_environment(self):
         rendered = deploy.render_user_data(

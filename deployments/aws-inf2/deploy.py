@@ -42,6 +42,12 @@ class Config:
     swap_gib: int
     neuron_cc_flags: str
     ami_id: str | None
+    # Defaulted so existing callers (and the MCP server, which builds a Config
+    # to render user-data) keep working unchanged. The safe default is the old
+    # behaviour: cold start, retain the volume.
+    cache_volume_id: str | None = None
+    reuse_cache: bool = False
+    delete_cache: bool = False
 
 
 def _boto3():
@@ -96,6 +102,69 @@ def resolve_ami(ec2: Any, explicit: str | None) -> str:
     return images[0]["ImageId"]
 
 
+def subnet_az(ec2: Any, subnet_id: str) -> str:
+    subnets = ec2.describe_subnets(SubnetIds=[subnet_id]).get("Subnets", [])
+    if not subnets:
+        raise RuntimeError(f"Subnet {subnet_id} not found")
+    return subnets[0]["AvailabilityZone"]
+
+
+def find_reusable_cache_volume(ec2: Any, project: str, az: str) -> str | None:
+    """An unattached cache volume for this project in the launch AZ, if exactly one.
+
+    EBS volumes are AZ-locked, so the AZ filter is a correctness constraint and
+    not a preference. Returns None when there is nothing to reuse; raises when
+    the choice is ambiguous rather than picking arbitrarily — attaching the
+    wrong cache is worse than a cold start, because it looks like it worked.
+    """
+    response = ec2.describe_volumes(
+        Filters=[
+            {"Name": "tag:Project", "Values": [project]},
+            {"Name": "status", "Values": ["available"]},
+            {"Name": "availability-zone", "Values": [az]},
+        ]
+    )
+    volumes = sorted(
+        response.get("Volumes", []),
+        key=lambda v: v.get("CreateTime"),
+        reverse=True,
+    )
+    if not volumes:
+        return None
+    if len(volumes) > 1:
+        ids = ", ".join(v["VolumeId"] for v in volumes)
+        raise RuntimeError(
+            f"{len(volumes)} reusable cache volumes for project {project!r} in {az}: "
+            f"{ids}. Pass --cache-volume-id to choose, or delete the extras."
+        )
+    return volumes[0]["VolumeId"]
+
+
+def resolve_cache_volume(ec2: Any, config: Config, az: str) -> str | None:
+    """The existing volume to attach after launch, or None to create a fresh one."""
+    if config.cache_volume_id:
+        volumes = ec2.describe_volumes(VolumeIds=[config.cache_volume_id]).get("Volumes", [])
+        if not volumes:
+            raise RuntimeError(f"Cache volume {config.cache_volume_id} not found")
+        volume = volumes[0]
+        if volume["AvailabilityZone"] != az:
+            raise RuntimeError(
+                f"Cache volume {config.cache_volume_id} is in "
+                f"{volume['AvailabilityZone']} but the subnet is in {az}. EBS volumes "
+                "cannot cross an Availability Zone — launch into that AZ, or omit "
+                "--cache-volume-id to start cold."
+            )
+        if volume["State"] != "available":
+            raise RuntimeError(
+                f"Cache volume {config.cache_volume_id} is {volume['State']}, not "
+                "available; it is probably still attached to another host."
+            )
+        return config.cache_volume_id
+    if config.reuse_cache:
+        return find_reusable_cache_volume(ec2, config.project, az)
+    return None
+
+
 def existing_hosts(ec2: Any, project: str) -> list[dict[str, Any]]:
     response = ec2.describe_instances(
         Filters=[
@@ -134,6 +203,9 @@ def launch(config: Config, apply: bool) -> dict[str, Any]:
             f"{config.region}: {ids}"
         )
 
+    az = subnet_az(ec2, config.subnet_id)
+    reuse_volume = resolve_cache_volume(ec2, config, az)
+
     ami_id = resolve_ami(ec2, config.ami_id)
     request: dict[str, Any] = {
         "ImageId": ami_id,
@@ -148,6 +220,11 @@ def launch(config: Config, apply: bool) -> dict[str, Any]:
             "HttpTokens": "required",
             "HttpEndpoint": "enabled",
         },
+        # Only the root volume is described here. RunInstances cannot attach an
+        # EXISTING volume — BlockDeviceMappings only ever creates new ones — so
+        # the cache volume is attached separately below, whether reused or fresh.
+        # Creating it here is what silently minted a new 150 GB volume on every
+        # launch while the previous one sat unattached and billing.
         "BlockDeviceMappings": [
             # The root volume is rebuilt from the AMI on every launch, so
             # retaining it would only orphan a paid volume nothing reattaches.
@@ -157,17 +234,6 @@ def launch(config: Config, apply: bool) -> dict[str, Any]:
                     "VolumeSize": config.volume_gib,
                     "VolumeType": "gp3",
                     "DeleteOnTermination": True,
-                    "Encrypted": True,
-                },
-            },
-            # The Neuron/XLA compile caches do survive: recompiling the Gemma
-            # graph from cold costs far more than the idle volume does.
-            {
-                "DeviceName": CACHE_DEVICE,
-                "Ebs": {
-                    "VolumeSize": config.cache_volume_gib,
-                    "VolumeType": "gp3",
-                    "DeleteOnTermination": False,
                     "Encrypted": True,
                 },
             },
@@ -200,6 +266,7 @@ def launch(config: Config, apply: bool) -> dict[str, Any]:
     plan = {
         "action": "launch" if apply else "plan",
         "region": config.region,
+        "availability_zone": az,
         "ami_id": ami_id,
         "ami_source": "explicit" if config.ami_id else "auto-discovered (SDK line NOT pinned)",
         "instance_type": config.instance_type,
@@ -207,7 +274,13 @@ def launch(config: Config, apply: bool) -> dict[str, Any]:
         "project": config.project,
         "source_uri": config.source_uri,
         "root_volume_gib": config.volume_gib,
-        "cache_volume_gib": config.cache_volume_gib,
+        "cache_volume": (
+            {"action": "reuse", "volume_id": reuse_volume,
+             "effect": "skips the checkpoint download and the NEFF compile"}
+            if reuse_volume else
+            {"action": "create", "size_gib": config.cache_volume_gib,
+             "effect": "cold start: full download and compile"}
+        ),
         "cache_volume_retained_on_terminate": True,
         "swap_gib": config.swap_gib,
         "neuron_cc_flags": config.neuron_cc_flags,
@@ -218,7 +291,37 @@ def launch(config: Config, apply: bool) -> dict[str, Any]:
 
     response = ec2.run_instances(**request)
     instance = response["Instances"][0]
-    return {**plan, "instance_id": instance["InstanceId"], "state": "pending"}
+    instance_id = instance["InstanceId"]
+
+    volume_id = reuse_volume
+    if volume_id is None:
+        volume_id = ec2.create_volume(
+            AvailabilityZone=az,
+            Size=config.cache_volume_gib,
+            VolumeType="gp3",
+            Encrypted=True,
+            TagSpecifications=[{
+                "ResourceType": "volume",
+                "Tags": [
+                    {"Key": "Name", "Value": f"{config.project}-cache"},
+                    {"Key": "Project", "Value": config.project},
+                ],
+            }],
+        )["VolumeId"]
+        ec2.get_waiter("volume_available").wait(VolumeIds=[volume_id])
+
+    # Attach cannot proceed until the instance leaves `pending`. user_data.sh
+    # waits up to CACHE_WAIT_SECS for the device, so a slow attach costs a pause
+    # rather than a silent fall back onto the ephemeral root volume.
+    ec2.get_waiter("instance_running").wait(InstanceIds=[instance_id])
+    ec2.attach_volume(Device=CACHE_DEVICE, InstanceId=instance_id, VolumeId=volume_id)
+
+    return {
+        **plan,
+        "instance_id": instance_id,
+        "state": "running",
+        "cache_volume_attached": volume_id,
+    }
 
 
 def terminate(config: Config, apply: bool) -> dict[str, Any]:
@@ -239,9 +342,15 @@ def terminate(config: Config, apply: bool) -> dict[str, Any]:
         "region": config.region,
         "project": config.project,
         "targets": targets,
-        # Retained volumes bill until deleted; the launcher never reattaches
-        # them, so reuse is a manual attach and deletion is a manual choice.
-        "note": "cache volumes are retained and keep billing; delete or reattach them yourself",
+        "cache_volumes": "delete" if config.delete_cache else "retain",
+        "note": (
+            "cache volumes will be DELETED; the next launch downloads the "
+            "checkpoint and recompiles from cold"
+            if config.delete_cache else
+            "cache volumes are retained and keep billing (~$0.08/GiB-month). "
+            "Relaunch with --reuse-cache to pick them up, or terminate with "
+            "--delete-cache to stop the charge."
+        ),
     }
     if not apply:
         return plan
@@ -249,7 +358,21 @@ def terminate(config: Config, apply: bool) -> dict[str, Any]:
     ec2.terminate_instances(
         InstanceIds=[target["instance_id"] for target in targets]
     )
-    return {**plan, "state": "shutting-down"}
+
+    deleted = []
+    if config.delete_cache:
+        volume_ids = [t["cache_volume_id"] for t in targets if t["cache_volume_id"]]
+        if volume_ids:
+            # A volume cannot be deleted while it is still attached, and
+            # terminate_instances returns before the detach completes.
+            ec2.get_waiter("instance_terminated").wait(
+                InstanceIds=[t["instance_id"] for t in targets]
+            )
+        for volume_id in volume_ids:
+            ec2.delete_volume(VolumeId=volume_id)
+            deleted.append(volume_id)
+
+    return {**plan, "state": "shutting-down", "deleted_volumes": deleted}
 
 
 def parse_args() -> tuple[argparse.Namespace, Config]:
@@ -274,6 +397,17 @@ def parse_args() -> tuple[argparse.Namespace, Config]:
     parser.add_argument("--swap-gib", type=int, default=32)
     parser.add_argument("--neuron-cc-flags", default="--model-type=transformer")
     parser.add_argument("--ami-id")
+    # Reusing the cache volume is the single biggest startup win: it carries the
+    # ~9.6 GB checkpoint and the Neuron compile cache, which together dominate a
+    # cold start. EBS is AZ-locked, so the volume's AZ constrains --subnet-id.
+    parser.add_argument("--cache-volume-id",
+                        help="Attach this existing volume instead of creating one.")
+    parser.add_argument("--reuse-cache", action="store_true",
+                        help="Attach an available volume tagged Project=<project> "
+                             "in the launch AZ, if exactly one exists.")
+    parser.add_argument("--delete-cache", action="store_true",
+                        help="terminate only: also delete the cache volumes, "
+                             "which otherwise keep billing.")
     args = parser.parse_args()
     if args.apply and args.command not in ("launch", "terminate"):
         parser.error("--apply is only valid with launch or terminate")

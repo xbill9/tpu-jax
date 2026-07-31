@@ -222,15 +222,70 @@ cold costs far more than the idle volume does.
 Teardown plans first, like launch:
 
 ```bash
-python3 deployments/aws-inf2/deploy.py terminate --region us-east-1   # plan
-python3 deployments/aws-inf2/deploy.py terminate --apply --region us-east-1
+python3 deployments/aws-inf2/deploy.py terminate --region us-east-2   # plan
+python3 deployments/aws-inf2/deploy.py terminate --apply --region us-east-2
+
+# ...or terminate and stop the volume charge in one step
+python3 deployments/aws-inf2/deploy.py terminate --apply --delete-cache --region us-east-2
 ```
 
-The output lists the retained cache volume ID per host. That volume keeps
-billing until you delete it. `deploy.py` does not reattach it — to reuse the
-caches, attach it to the new instance as `/dev/sdf` in the same Availability
-Zone before the service starts; `user_data.sh` mounts any already-formatted
-non-root disk it finds and skips `mkfs`.
+Without `--delete-cache` the volume is retained and keeps billing (~$0.08/GiB-month),
+which is what you want between runs and not what you want when you are done.
+
+## Fast relaunch: reuse the cache volume
+
+A cold start is roughly 15–25 minutes, and two terms dominate it: the ~9.6 GB
+checkpoint download and the Neuron graph compile (measured at 1173 s for the
+full-E2B decode step on 4 cores). Both land on the cache volume, so reattaching
+it skips both.
+
+```bash
+python3 deployments/aws-inf2/deploy.py launch --apply \
+  --region us-east-2 --reuse-cache \
+  --subnet-id subnet-... --security-group-id sg-... \
+  --instance-profile-name gemma4-inf2 \
+  --source-uri s3://my-bucket/tpu-jax-inf2.tar.gz
+```
+
+`--reuse-cache` attaches an available volume tagged `Project=<project>` in the
+launch AZ, and falls back to creating one when there is nothing to reuse.
+`--cache-volume-id vol-...` names one explicitly. Ambiguity is an error rather
+than a guess: attaching the wrong cache is worse than a cold start because it
+looks like it worked.
+
+Two constraints worth knowing before you plan a launch:
+
+- **EBS is AZ-locked.** The volume's Availability Zone dictates the subnet you
+  can launch into. `deploy.py` refuses a mismatch and names both zones. This
+  interacts with spot capacity — on 2026-07-31 `us-east-2c` had no
+  `inf2.8xlarge` spot capacity at all while `2a` and `2b` did, so the cheapest
+  zone and the zone holding your cache are not always the same one.
+- **The volume is attached after the instance launches**, because `RunInstances`
+  can only *create* volumes, never attach existing ones. `user_data.sh` waits up
+  to `CACHE_WAIT_SECS` (180 s) for the device to appear. If it gives up, it says
+  so loudly and falls back to the root volume — where the caches are destroyed at
+  termination.
+
+## When a bootstrap fails, retry it in place
+
+The bootstrap records a marker per completed phase under
+`/var/lib/gemma4-bootstrap`, so it is re-runnable:
+
+```bash
+sudo bash /var/lib/cloud/instance/user-data.txt
+```
+
+Completed phases are skipped, so a failure in the last step costs a retry rather
+than a fresh 15-minute launch. The source bundle is deliberately *not* phase
+marked — it is the one thing that changes between runs, and skipping it would
+silently serve stale code.
+
+`jax_neuron/probe.py` runs as a gate immediately after the Python dependencies
+and before the checkpoint download. It exercises driver, PJRT plugin, `PATH`,
+and `neuronx-cc` together in about a minute. Every bootstrap defect listed below
+surfaces there; without the gate the first thing to touch the accelerator is the
+model load, ~20 minutes in, and it reports as an XLA error rather than as a setup
+problem.
 
 ## Validate on the host
 
