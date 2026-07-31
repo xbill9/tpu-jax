@@ -42,6 +42,9 @@ class Config:
     swap_gib: int
     neuron_cc_flags: str
     ami_id: str | None
+    # Optional and last so existing callers constructing Config positionally
+    # keep working.
+    cache_volume_id: str | None = None
 
 
 def _boto3():
@@ -135,6 +138,29 @@ def launch(config: Config, apply: bool) -> dict[str, Any]:
         )
 
     ami_id = resolve_ami(ec2, config.ami_id)
+
+    # A retained cache volume can be reattached instead of provisioning a blank
+    # one. It holds the weight download and the Neuron/XLA compile caches, so
+    # reuse turns a ~20 minute cold start into a ~2 minute one. EBS cannot cross
+    # an Availability Zone, so the volume pins the subnet -- check that here
+    # rather than letting run_instances fail after the request is built.
+    reuse_cache = config.cache_volume_id is not None
+    if reuse_cache:
+        vol = ec2.describe_volumes(VolumeIds=[config.cache_volume_id])["Volumes"][0]
+        if vol["State"] != "available":
+            raise RuntimeError(
+                f"cache volume {config.cache_volume_id} is {vol['State']}, not "
+                "available; detach it from its current host first"
+            )
+        subnet_az = ec2.describe_subnets(
+            SubnetIds=[config.subnet_id])["Subnets"][0]["AvailabilityZone"]
+        if vol["AvailabilityZone"] != subnet_az:
+            raise RuntimeError(
+                f"cache volume {config.cache_volume_id} is in "
+                f"{vol['AvailabilityZone']} but --subnet-id is in {subnet_az}; "
+                "EBS volumes cannot cross an Availability Zone"
+            )
+
     request: dict[str, Any] = {
         "ImageId": ami_id,
         "InstanceType": config.instance_type,
@@ -191,6 +217,14 @@ def launch(config: Config, apply: bool) -> dict[str, Any]:
             },
         ],
     }
+    if reuse_cache:
+        # Drop the blank cache volume from the mapping; the retained one is
+        # attached after the instance reaches `running` (attach_volume cannot
+        # run against a pending instance).
+        request["BlockDeviceMappings"] = [
+            m for m in request["BlockDeviceMappings"] if m["DeviceName"] != CACHE_DEVICE
+        ]
+
     if config.market_type == "spot":
         request["InstanceMarketOptions"] = {
             "MarketType": "spot",
@@ -209,6 +243,7 @@ def launch(config: Config, apply: bool) -> dict[str, Any]:
         "root_volume_gib": config.volume_gib,
         "cache_volume_gib": config.cache_volume_gib,
         "cache_volume_retained_on_terminate": True,
+        "cache_volume_reused": config.cache_volume_id or "no (fresh blank volume)",
         "swap_gib": config.swap_gib,
         "neuron_cc_flags": config.neuron_cc_flags,
         "api_exposure": "127.0.0.1:8000 (SSM/private proxy required)",
@@ -218,7 +253,18 @@ def launch(config: Config, apply: bool) -> dict[str, Any]:
 
     response = ec2.run_instances(**request)
     instance = response["Instances"][0]
-    return {**plan, "instance_id": instance["InstanceId"], "state": "pending"}
+    instance_id = instance["InstanceId"]
+
+    if reuse_cache:
+        # user_data mounts any already-formatted non-root disk it finds and
+        # skips mkfs, so the attach only has to win the race against the
+        # bootstrap reaching that step -- which it does, since the bootstrap
+        # spends its first stretch on apt.
+        ec2.get_waiter("instance_running").wait(InstanceIds=[instance_id])
+        ec2.attach_volume(VolumeId=config.cache_volume_id,
+                          InstanceId=instance_id, Device=CACHE_DEVICE)
+
+    return {**plan, "instance_id": instance_id, "state": "pending"}
 
 
 def terminate(config: Config, apply: bool) -> dict[str, Any]:
@@ -270,6 +316,10 @@ def parse_args() -> tuple[argparse.Namespace, Config]:
     parser.add_argument("--max-model-len", type=int, default=4096)
     parser.add_argument("--volume-gib", type=int, default=200)
     parser.add_argument("--cache-volume-gib", type=int, default=200)
+    # Reattach a retained cache volume (weights + Neuron/XLA compile caches)
+    # instead of provisioning a blank one. Must be `available` and in the same
+    # AZ as --subnet-id. `terminate` prints the id of the volume it kept.
+    parser.add_argument("--cache-volume-id")
     # A 16 GiB inf2.xlarge host OOM-kills the Neuron graph load without swap.
     parser.add_argument("--swap-gib", type=int, default=32)
     parser.add_argument("--neuron-cc-flags", default="--model-type=transformer")
