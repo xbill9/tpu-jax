@@ -10,6 +10,7 @@ Run: python3 -m unittest tests.test_windowed_kv
 
 import sys
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 import jax
@@ -94,6 +95,22 @@ class WindowedKVTest(unittest.TestCase):
         prompt = jax.random.randint(jax.random.PRNGKey(1), (1, WINDOW - 1), 1, self.config.vocab_size)
         a, _ = generate(self.model, self.params, prompt, 4, window_kv=False)
         b, _ = generate(self.model, self.params, prompt, 4, window_kv=True)
+        self.assertEqual(a.tolist(), b.tolist())
+
+    def test_decode_when_total_cache_is_shorter_than_window(self):
+        """The ring mask must match the allocated cache, not the configured window."""
+        config = replace(self.config, sliding_window=16)
+        model = Gemma4EModelJAX(config)
+        params = build_tiny_params(config)
+        prompt = jax.random.randint(
+            jax.random.PRNGKey(4), (1, 2), 1, config.vocab_size)
+        # total cache length is 4, well below sliding_window=16. The old code
+        # produced attention scores over 4 keys and a mask over 16 keys.
+        a, la = generate(model, params, prompt, 2, window_kv=False)
+        b, lb = generate(model, params, prompt, 2, window_kv=True)
+        for i, (x, y) in enumerate(zip(la, lb)):
+            self.assertLess(float(jnp.max(jnp.abs(x - y))), 1e-4,
+                            f"step {i} diverges with a short ring")
         self.assertEqual(a.tolist(), b.tolist())
 
     def test_same_tokens_when_prompt_exceeds_window(self):

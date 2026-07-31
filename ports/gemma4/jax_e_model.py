@@ -1390,8 +1390,13 @@ def make_cached_decode_step(model: Gemma4EModelJAX, quant_mode: str = "w4a16",
             sliding_mask = None
         elif window_kv:
             # Sliding layers attend over their ring buffer, not the full cache.
+            # A short request allocates fewer slots than the configured window:
+            # init_kv_cache uses min(total_len, window). Match that physical
+            # length here instead of constructing (for E4B) an unconditional
+            # 512-key mask for, e.g., a 72-key cache.
+            ring_len = min(int(window), valid.shape[1])
             sliding_mask = make_ring_decode_mask(
-                valid.shape[0], int(window), jnp.asarray(slot, jnp.int32) + 1)
+                valid.shape[0], ring_len, jnp.asarray(slot, jnp.int32) + 1)
         else:
             sliding_mask = make_decode_mask(valid, window=window, slot=slot)
         logits, caches = model(
