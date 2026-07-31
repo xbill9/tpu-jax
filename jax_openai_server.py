@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""OpenAI-Compatible FastAPI Server for pure JAX Gemma 4 on TPU v6e-1.
+"""OpenAI-compatible FastAPI server for the pure-JAX Gemma 4 engine.
 
 Generation runs entirely on the pure-JAX engine in ``jax_engine.py`` (no
 PyTorch, no torch_xla) against a static KV cache, so every streamed token
@@ -24,11 +24,13 @@ import time
 import jax
 from pydantic import BaseModel
 
-# Enable native TPU MXU bfloat16 matmul precision
+# Request BF16 matmul precision on accelerator backends.
 jax.config.update("jax_default_matmul_precision", "bfloat16")
 
 # Persistent XLA compilation disk cache (skips ~17s of compilation on restarts)
-_cache_dir = os.path.expanduser("~/.cache/jax_compilation_cache")
+_cache_dir = os.path.expanduser(
+    os.environ.get("JAX_COMPILATION_CACHE_DIR", "~/.cache/jax_compilation_cache")
+)
 os.makedirs(_cache_dir, exist_ok=True)
 jax.config.update("jax_compilation_cache_dir", _cache_dir)
 jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
@@ -56,7 +58,7 @@ METRICS = {
     "last_prefill_ms": 0.0,
 }
 
-app = FastAPI(title="Pure JAX Gemma 4 W4A16 QAT Server on TPU v6e-1")
+app = FastAPI(title="Pure JAX Gemma 4 W4A16 QAT Server")
 
 
 class ChatMessage(BaseModel):
@@ -162,13 +164,19 @@ def _eos_ids() -> list[int]:
             ids.append(val)
         elif isinstance(val, list):
             ids.extend(v for v in val if isinstance(v, int))
-    # Gemma chat turns terminate on <end_of_turn>
-    try:
-        turn_end = TOKENIZER.convert_tokens_to_ids("<end_of_turn>")
-        if isinstance(turn_end, int) and turn_end >= 0:
+    # Gemma chat turns terminate on the turn-end marker, but its spelling differs
+    # by checkpoint: <end_of_turn> on some, <turn|> on the QAT E2B ones. A name
+    # absent from the vocab does not raise -- convert_tokens_to_ids returns
+    # unk_token_id, which is >= 0 and so passed the old guard. That put <unk> in
+    # the stop set while leaving the REAL terminator out of it.
+    unk = getattr(TOKENIZER, "unk_token_id", None)
+    for name in ("<end_of_turn>", "<turn|>"):
+        try:
+            turn_end = TOKENIZER.convert_tokens_to_ids(name)
+        except Exception:
+            continue
+        if isinstance(turn_end, int) and turn_end >= 0 and turn_end != unk:
             ids.append(turn_end)
-    except Exception:
-        pass
     return sorted(set(ids))
 
 
@@ -291,7 +299,7 @@ def list_models():
     return {
         "object": "list",
         "data": [
-            {"id": MODEL_ID, "object": "model", "created": int(time.time()), "owned_by": "jax-tpu"}
+            {"id": MODEL_ID, "object": "model", "created": int(time.time()), "owned_by": "jax"}
         ],
     }
 
