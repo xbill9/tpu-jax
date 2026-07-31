@@ -1,0 +1,17 @@
+# Extra dependencies for the greedy-parity gate (`jax_neuron/parity.py`).
+#
+# Deliberately NOT in requirements-serving.txt. This is a correctness tool, not
+# a serving dependency: the server never imports torch, and adding a ~200 MB
+# wheel to every deployment to support a test that runs once would be a poor
+# trade. Install it on the host only when running parity:
+#
+#   /opt/gemma4/venv/bin/python -m pip install \
+#     -r /opt/gemma4/app/deployments/aws-inf2/requirements-parity.txt \
+#     --extra-index-url https://download.pytorch.org/whl/cpu
+#
+# CPU torch specifically. The oracle's whole value is being an *independent*
+# implementation running on the host CPU — the reference must not touch the
+# NeuronCores, both because a shared bug would invalidate the comparison and
+# because the serving process owns both logical cores while it is up.
+torch
+accelerate
