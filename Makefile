@@ -17,7 +17,7 @@ help:
 	@echo " Gemma-4 DevOps Agents - Root Makefile"
 	@echo "========================================================="
 	@echo "Available commands:"
-	@echo "  make clean   - Run 'make clean' in all subdirectories"
+	@echo "  make clean   - Clean build artifacts ($(DIST_DIR)/, pycache, test caches) + subdirectories"
 	@echo "  make test    - Run the repo unit tests (tests/) + 'make test' in subdirectories"
 	@echo "  make lint    - ruff + bash -n on repo sources, then 'make lint' in subdirectories"
 	@echo "  make install - Run 'make install' in all subdirectories"
@@ -62,6 +62,10 @@ skill-package: skill
 # Target-specific variable assignments
 clean: TARGET := clean
 clean: $(SUBDIRS)
+	rm -rf $(DIST_DIR) .pytest_cache .ruff_cache .mypy_cache .coverage
+	find . -type d -name "__pycache__" -exec rm -rf {} +
+	find . -type f \( -name "*.pyc" -o -name "*.pyo" -o -name "*.pyd" \) -delete
+	@echo "Clean complete."
 
 test: TARGET := test
 test: $(SUBDIRS)

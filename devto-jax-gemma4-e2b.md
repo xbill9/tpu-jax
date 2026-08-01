@@ -112,7 +112,40 @@ residency ceilings, not promises that the same number of full prompts can be
 prefilled together. Prefill has a separate measured rule:
 `batch × chunk_size <= 8,192` prompt tokens per pass.
 
-The binding constraint is compute and scheduling. Which is where it gets interesting.
+**So the chip isn't full. The problem is that my server only runs one request at
+a time.**
+
+Here is the entire proof. One request decodes at 140.5 tok/s. Eight requests at
+once decode at 143.3 tok/s *combined* — eight times the work for 2% more output.
+Each user just waits eight times longer, 497 ms to 1,775 ms. Nothing ran out of
+memory and no request failed. The chip wasn't full and it wasn't slow. It was
+doing one request at a time while the other seven queued, which is exactly what
+the code says: `generate_stream` is B=1, and FastAPI launches independent B=1
+executions.
+
+It also isn't a speed problem, and that distinction matters because it points at
+different work. The same chip's decode kernel does 2,888 tok/s at batch 32 —
+about 20× what my server delivers. So the hardware is sitting idle. Batching
+would have to claim that 20× before a faster kernel is worth writing.
+
+**Memory: 43× more than I need. Speed: 20× more than I'm using. Batching: none.**
+The fix is a request batcher, not a bigger chip.
+
+To be precise: I mean **request** scheduling — which requests share a device
+execution — not how HBM streams data. HBM efficiency is a real constraint, but
+it's the next one. You can't tune a batch that doesn't exist.
+
+### So how many agents should one chip run?
+
+Weights cost the same per step no matter the batch — about 1.86 GB streamed, not
+the full 6.56 GB, since the PLE table is gathered rather than streamed. KV grows
+with agents × context. So agents are cheap until KV traffic overtakes the weight
+read.
+
+Where that crossover lands, I can't say yet: measuring it needs a batcher, and
+this server doesn't have one. But I suspect it isn't a number of agents at all,
+rather a combination of agent count and context size — eight agents at 8K should
+behave much like thirty-two at 2K.
 
 ## Feasibility, part 2: what agent workloads need that raw JAX doesn't have
 
