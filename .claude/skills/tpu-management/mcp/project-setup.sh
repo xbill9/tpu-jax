@@ -108,7 +108,7 @@ if [ "$SKIP_DEPS" -eq 0 ]; then
     info "python dependencies OK (system python3)"
   else
     echo "warning: python3 is missing server dependencies; install them with:" >&2
-    echo "    pip install -r $SKILL_DEST/mcp/requirements.txt" >&2
+    echo "    python3 -m pip install --upgrade --upgrade-strategy eager -r $SKILL_DEST/mcp/requirements.txt" >&2
   fi
 else
   info "skipping dependency check (--skip-deps)"

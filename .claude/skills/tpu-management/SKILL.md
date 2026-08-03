@@ -176,8 +176,15 @@ serving, provision with `workload="jax"`:
    `find_tpu_vm(workload="jax")`. The startup script installs `JAX_PYTHON_VERSION`
    (default 3.13) from deadsnakes and pip-installs `JAX_PIP_SPEC` (default
    `jax[tpu]`) into it directly — no venv, per this repo's standard; the dedicated
-   interpreter provides the isolation. No docker, no Hugging Face token, no
+   interpreter provides the isolation. It upgrades the Python packaging stack and
+   all configured extras, and installs the latest compiler/build tools available
+   from the configured Ubuntu repositories. Default extras include the tokenizer
+   stack (`transformers`, `tokenizers`, `sentencepiece`, Jinja 3.1+) required by
+   the validation harness. No docker, no Hugging Face token, no
    200 GB image pull, so it boots in a couple of minutes rather than ~8.5.
+   The startup script then upgrades `libtpu` independently to the newest wheel on
+   Google's JAX releases index, overriding the conservative version bundled by
+   the `jax[tpu]` extra; its TPU device assertion is the compatibility gate.
 2. `wait_for_jax_ready` polls the serial console for
    `JAX-BOOTLOADER: TPU environment ready.` and fails fast on
    `JAX-BOOTLOADER: FAILED`. `verify_jax_tpu` re-runs the device check over SSH.

@@ -96,11 +96,11 @@ JAX_PIP_SPEC = os.getenv("JAX_PIP_SPEC", "jax[tpu]")
 CPU_DEBUG_MACHINE_TYPE = os.getenv("CPU_DEBUG_MACHINE_TYPE", "e2-highmem-16")
 CPU_DEBUG_PIP_SPEC = os.getenv(
     "CPU_DEBUG_PIP_SPEC",
-    "jax numpy scipy ml_dtypes safetensors huggingface_hub transformers",
+    "jax numpy scipy ml_dtypes safetensors huggingface_hub transformers sentencepiece 'jinja2>=3.1'",
 )
 JAX_PIP_EXTRAS = os.getenv(
     "JAX_PIP_EXTRAS",
-    "numpy scipy ml_dtypes safetensors huggingface_hub",
+    "numpy scipy ml_dtypes safetensors huggingface_hub transformers sentencepiece 'jinja2>=3.1'",
 )
 
 # find_tpu records per-zone provisioning outcomes here so later sweeps can skip

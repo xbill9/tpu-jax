@@ -36,7 +36,9 @@ done
 
 # software-properties-common provides add-apt-repository, which is NOT installed
 # on the accelerator image by default.
-apt-get install -y software-properties-common curl
+# Install the newest compiler/build tools published by the configured Ubuntu
+# repositories. Native extensions then build against a current toolchain.
+apt-get install -y software-properties-common curl build-essential clang cmake ninja-build
 
 # The stock Ubuntu 22.04 interpreter is 3.10 and pins JAX to an old release.
 # deadsnakes carries current CPython for jammy.
@@ -56,13 +58,19 @@ $PY --version
 # No venv, per this repo's standard: the dedicated interpreter is the isolation.
 curl -fsSL https://bootstrap.pypa.io/get-pip.py -o /tmp/get-pip.py
 $PY /tmp/get-pip.py
-$PY -m pip install --upgrade pip setuptools wheel
+$PY -m pip install --upgrade pip setuptools wheel packaging
 
 # libtpu comes from the JAX releases index, not PyPI.
 $PY -m pip install --upgrade {jax_pip_spec} \
   -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+# JAX's TPU extra pins the libtpu version it was released against. This project
+# deliberately tracks the newest published TPU runtime instead: install it after
+# JAX and bypass that conservative transitive pin. Device verification below is
+# the compatibility gate.
+$PY -m pip install --upgrade --no-deps libtpu \
+  -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
 if [ -n "{jax_pip_extras}" ]; then
-  $PY -m pip install --upgrade {jax_pip_extras} || echo "WARNING: extras install failed (non-fatal)"
+  $PY -m pip install --upgrade --upgrade-strategy eager {jax_pip_extras} || echo "WARNING: extras install failed (non-fatal)"
 fi
 
 # Prove the accelerator is actually visible. Importing jax succeeds on a host
@@ -78,7 +86,7 @@ if not any(d.platform == "tpu" for d in devs):
 print("TPU chips visible:", len(devs))
 PYEOF
 
-$PY -m pip list 2>/dev/null | grep -iE "^(jax|jaxlib|libtpu|numpy|scipy|ml.dtypes|safetensors) " || true
+$PY -m pip list 2>/dev/null | grep -iE "^(jax|jaxlib|libtpu|numpy|scipy|ml.dtypes|safetensors|huggingface.hub|transformers|tokenizers|sentencepiece|jinja2) " || true
 
 # libtpu creates /tmp/tpu_logs as root here; without this every later non-root
 # run spams "Could not open the log file ... Permission denied".

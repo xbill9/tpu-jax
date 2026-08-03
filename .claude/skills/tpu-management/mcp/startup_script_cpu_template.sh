@@ -36,7 +36,9 @@ for i in $(seq 1 30); do
 done
 
 # add-apt-repository is not on the base image.
-apt-get install -y software-properties-common curl git
+# Install the newest compiler/build tools published by the configured Ubuntu
+# repositories. Never create a virtual environment.
+apt-get install -y software-properties-common curl git build-essential clang cmake ninja-build
 
 # Stock Ubuntu 22.04 ships Python 3.10, which pins JAX to an old release.
 if ! command -v $PY >/dev/null 2>&1; then
@@ -55,10 +57,10 @@ $PY --version
 # repo's standard: the dedicated interpreter provides the isolation.
 curl -fsSL https://bootstrap.pypa.io/get-pip.py -o /tmp/get-pip.py
 $PY /tmp/get-pip.py
-$PY -m pip install --upgrade pip setuptools wheel
+$PY -m pip install --upgrade pip setuptools wheel packaging
 
 # CPU JAX: no libtpu, no -f jax-releases index.
-$PY -m pip install --upgrade {pip_spec}
+$PY -m pip install --upgrade --upgrade-strategy eager {pip_spec}
 
 # Assert the stack actually works. Importing jax succeeds in almost any broken
 # state, so assert on a real computation and on the CPU device being present.
