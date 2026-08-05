@@ -373,17 +373,32 @@ def apply_rope_jax(
 _MASK_MIN = -1e9
 
 
-def make_ring_decode_mask(batch: int, window: int, positions_written: jax.Array) -> jax.Array:
+def make_ring_decode_mask(valid_mask: jax.Array, window: int, slot: jax.Array) -> jax.Array:
     """Additive mask over a windowed sliding layer's ring buffer at decode.
 
-    The ring holds exactly the most recent `window` positions, so once it has
-    wrapped every slot is valid and no window arithmetic is needed — before that,
-    only slots [0, positions_written) hold real tokens. Returns [B, 1, 1, window].
+    Ring slot r holds the most recent absolute position p <= slot for which
+    p % window == r. Read `valid` at that position.
+
+    The obvious shortcut — "slots [0, slot] are filled, everything else is not" —
+    is wrong, and wrong silently. The cache is NOT filled contiguously: the
+    server right-pads every prompt to a static bucket and then decodes at
+    bucket + step while the logical position tracks the real length
+    (jax_engine.py:434), so the pad slots [real_len, bucket) sit *inside*
+    [0, slot). Assuming a contiguous fill attends to pad K/V and corrupts the
+    output with no error at all. The non-windowed path has always taken `valid`
+    (see make_decode_mask); this has to as well.
+
+    Returns [B, 1, 1, window].
     """
-    idx = jnp.arange(window)[None, :]
-    filled = jnp.minimum(jnp.asarray(positions_written, jnp.int32), window)
-    ok = jnp.broadcast_to(idx < filled, (batch, window))
-    return jnp.where(ok[:, None, None, :], 0.0, _MASK_MIN).astype(jnp.float32)
+    B, T = valid_mask.shape
+    s = jnp.asarray(slot, jnp.int32)
+    r = jnp.arange(window, dtype=jnp.int32)[None, :]
+    # Most recent absolute position living in each ring slot; negative before the
+    # ring has reached that slot at all.
+    pos = s - jnp.mod(s - r, jnp.int32(window))
+    gather = jnp.broadcast_to(jnp.clip(pos, 0, T - 1), (B, window))
+    real = jnp.take_along_axis(valid_mask, gather, axis=1) & (pos >= 0)
+    return jnp.where(real[:, None, None, :], 0.0, _MASK_MIN).astype(jnp.float32)
 
 
 def make_prefill_causal_mask(valid_mask: jax.Array, window: Optional[int] = None) -> jax.Array:
@@ -1394,9 +1409,9 @@ def make_cached_decode_step(model: Gemma4EModelJAX, quant_mode: str = "w4a16",
             # init_kv_cache uses min(total_len, window). Match that physical
             # length here instead of constructing (for E4B) an unconditional
             # 512-key mask for, e.g., a 72-key cache.
-            ring_len = min(int(window), valid.shape[1])
+            ring_len = min(int(valid.shape[1]), int(window))
             sliding_mask = make_ring_decode_mask(
-                valid.shape[0], ring_len, jnp.asarray(slot, jnp.int32) + 1)
+                valid, ring_len, jnp.asarray(slot, jnp.int32))
         else:
             sliding_mask = make_decode_mask(valid, window=window, slot=slot)
         logits, caches = model(

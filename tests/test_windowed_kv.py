@@ -45,15 +45,28 @@ def windowed_config() -> Gemma4EConfig:
     )
 
 
-def generate(model, params, prompt, n, window_kv):
+def generate(model, params, prompt, n, window_kv, real_len=None):
+    """Generate n tokens.
+
+    real_len: if set, the prompt is right-padded and only its first `real_len`
+      tokens are real -- which is what the server always does, since it pads to a
+      static bucket. Decode then writes at bucket_s + step, so the pad slots
+      [real_len, S) fall *inside* [0, slot) and a mask that assumes a contiguous
+      fill will attend to them.
+    """
     B, S = prompt.shape
-    valid_prompt = jnp.ones((B, S), dtype=jnp.bool_)
+    if real_len is None:
+        valid_prompt = jnp.ones((B, S), dtype=jnp.bool_)
+    else:
+        valid_prompt = jnp.arange(S)[None, :] < real_len
     last, caches, valid = prefill_with_kv_cache(
         model, prompt, valid_prompt, params, n,
         quant_mode="fp16", cache_dtype=DTYPE, window_kv=window_kv,
     )
     step = jax.jit(make_cached_decode_step(model, quant_mode="fp16", window_kv=window_kv))
-    lens = jnp.full((B,), S, dtype=jnp.int32)
+    # Logical position tracks the REAL length; the slot tracks the padded bucket.
+    # This mirrors jax_engine.py:434 exactly -- that split is what opens the gap.
+    lens = jnp.full((B,), S if real_len is None else real_len, dtype=jnp.int32)
     tok = jnp.argmax(last, axis=-1, keepdims=True)
     out, logits = [tok], [last]
     for t in range(n - 1):
@@ -121,6 +134,27 @@ class WindowedKVTest(unittest.TestCase):
         for i, (x, y) in enumerate(zip(la, lb)):
             d = float(jnp.max(jnp.abs(x - y)))
             self.assertLess(d, 1e-4, f"step {i} logits diverge by {d:.2e} under windowed KV")
+        self.assertEqual(a.tolist(), b.tolist())
+
+    def test_right_padded_prompt_does_not_attend_to_pads(self):
+        """Regression: the ring mask must consult `valid`, not assume contiguous fill.
+
+        The server pads every prompt to a static bucket and then decodes at
+        bucket_s + step while the logical position stays at the real length
+        (jax_engine.py:434). So the pad slots [real_len, bucket) sit INSIDE
+        [0, slot). make_ring_decode_mask marked everything under slot+1 as real,
+        so windowed layers attended to pad K/V -- silently, with no error.
+        make_decode_mask on the non-windowed path takes `valid` and excludes them,
+        which is why only window_kv=True corrupted. Every other test here fills
+        the prompt completely, so the gap never existed to be caught.
+        """
+        S, real = 3 * WINDOW, 3 * WINDOW - 3      # 12 slots, 9 real, 3 pad
+        prompt = jax.random.randint(jax.random.PRNGKey(5), (1, S), 1, self.config.vocab_size)
+        a, la = generate(self.model, self.params, prompt, 4, window_kv=False, real_len=real)
+        b, lb = generate(self.model, self.params, prompt, 4, window_kv=True, real_len=real)
+        for i, (x, y) in enumerate(zip(la, lb)):
+            d = float(jnp.max(jnp.abs(x - y)))
+            self.assertLess(d, 1e-4, f"step {i} logits diverge by {d:.2e} — ring mask attended to pads")
         self.assertEqual(a.tolist(), b.tolist())
 
     def test_decode_wraps_past_the_window(self):

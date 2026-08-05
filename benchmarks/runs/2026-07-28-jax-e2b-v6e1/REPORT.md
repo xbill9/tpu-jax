@@ -14,6 +14,28 @@
 > expected to hold roughly — but "expected to hold" is the reasoning that produced
 > the 2.79x retracted twice on this page. **Re-run before citing.**
 
+> **⚠ SUPERSEDED: this page's central conclusion is wrong.** Section 2c concludes
+> "the binding constraint is **memory, not latency**." Both halves have since been
+> retracted by `benchmarks/runs/2026-07-29-kv-quant-v6e1/REPORT.md` and
+> `benchmarks/runs/2026-07-29-real-http-v6e1/REPORT.md`:
+>
+> * **Every capacity ceiling here is ~2x low.** These runs used no buffer
+>   donation, so `dynamic_update_slice` kept two full KV caches live at once
+>   (addendum 4). Re-bisected with donation, ctx 8192 goes 712,704 -> **1,425,408**
+>   resident KV tokens at bf16 and **2,818,048** at int8 — exactly 2.000x, i.e.
+>   B=87 -> B=344 concurrent 8K sequences (addendum 5).
+> * **The OOM was not the KV cache.** Section 2c already identifies the real cause
+>   — `eager_attention_jax` materializing a fp32 `[B, heads, S_q, S_kv]` score
+>   matrix — but still labels the constraint "memory". It is a kernel defect.
+> * **The measured constraint is request scheduling, not memory.** On the real
+>   checkpoint over HTTP, one stream decodes at 140.5 tok/s and eight concurrent
+>   streams aggregate to 143.3 tok/s, with no OOM and no failed request. The
+>   device serializes B=1 executions; nothing runs out of HBM.
+>
+> The goodput table in 2c is also measured against a batch ceiling that no longer
+> exists ("64+ HBM OOM"), and the "B=32 / 5,743 tok/s" figure was separately
+> retracted as an artifact of prefilling every sequence simultaneously.
+
 ## 1. Baseline: what the engine actually does
 
 W4A16 reference path (dequantize → BF16 → matmul), bf16 KV cache.
@@ -94,6 +116,11 @@ phenomenon it was written up as.
 Raw: [`batch-scaling-realconfig.json`](batch-scaling-realconfig.json)
 
 ### 2c. Goodput: we are memory-limited, not latency-limited
+
+> **SUPERSEDED — see the retraction at the top of this page.** The ceilings below
+> are ~2x low (no buffer donation), the OOM is a kernel defect rather than a
+> capacity limit, and the constraint measured on the real checkpoint is request
+> scheduling. Retained as written for provenance.
 
 Applying the service-objective framing of DOI 10.5281/zenodo.21462837 (see
 `docs/references/tpu-inference-measurement-series.md`), at a 50 ms/token objective:
