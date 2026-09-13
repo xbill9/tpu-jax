@@ -4,7 +4,7 @@ Guidance for Claude Code when working in this repository.
 
 ## Project Overview
 
-This repository packages one Claude Code skill (`tpu-management`) and one **Model Context Protocol (MCP) server** (`tpu-devops`, a FastMCP app in `server.py`). Together they:
+This repository packages one Claude Code skill (`tpu-management`) and one **Model Context Protocol (MCP) server** (`tpu-devops`, an MCPServer app in `server.py`). Together they:
 
 1. **Operate TPU infrastructure:** find, provision, and destroy Google Cloud TPU capacity (flex-start VMs, queued resources) and run Gemma 4 vLLM serving on it.
 2. **Run bare JAX on TPU:** provision flex-start VMs with `workload="jax"` — the startup script installs a current CPython + `jax[tpu]` and asserts a TPU device is visible (`wait_for_jax_ready`, `verify_jax_tpu`). No docker, no HF token.
