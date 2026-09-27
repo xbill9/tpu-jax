@@ -44,3 +44,12 @@ coverage.xml
 # Local environment (contains live API keys)
 .env
 
+# Live AWS session credentials written by save-aws-creds.sh -- never commit
+.aws_creds
+.aws_creds.bak
+save-aws-creds.sh
+
+# Local agent tooling
+.agents/
+.codex/
+

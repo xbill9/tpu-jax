@@ -38,7 +38,9 @@ _PALLAS_INTERPRET = os.environ.get(
 jax.config.update("jax_default_matmul_precision", "bfloat16")
 
 # Persistent JAX XLA Compilation Disk Cache (skips ~17s compilation on restart)
-_cache_dir = os.path.expanduser("~/.cache/jax_compilation_cache")
+_cache_dir = os.path.expanduser(
+    os.environ.get("JAX_COMPILATION_CACHE_DIR", "~/.cache/jax_compilation_cache")
+)
 os.makedirs(_cache_dir, exist_ok=True)
 jax.config.update("jax_compilation_cache_dir", _cache_dir)
 jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)

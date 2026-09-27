@@ -219,6 +219,15 @@ class JaxGemmaEngine:
         # Anything holding a reference to a cache across steps must re-read it from
         # the step's return value, never reuse the object it passed in. Set False if
         # a caller needs the old cache to stay valid.
+        #
+        # Neuron is stricter than TPU here. Its PJRT plugin compiles a donated
+        # input as must-alias and then hard-fails at run time if the runtime
+        # cannot actually donate it ("An input was configured to be must-alias at
+        # compile time but not donated at runtime"), where TPU and GPU only warn
+        # and fall back to a copy. JAX_E_DONATE_CACHE=0 lets a platform wrapper
+        # switch donation off without threading a flag through the server CLI.
+        if os.environ.get("JAX_E_DONATE_CACHE", "").strip() == "0":
+            donate_cache = False
         self.donate_cache = donate_cache
         # Prefill, not decode, sets the batch ceiling. Measured on v6e-1 by
         # compile-time memory_analysis: prefill temporaries are LINEAR in the total
